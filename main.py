@@ -11,7 +11,8 @@ EXCHANGES = [
     'binance',
     'okx',
     'kucoin',
-    "hyperliquid"
+    'hyperliquid',
+    'mexc'
 ]
 
 logging.basicConfig(
@@ -43,5 +44,25 @@ def main_cli():
         display.print_error(str(e))
 
 
+def main_gui():
+    from gui.display import run_gui
+    run_gui()
+
+
 if __name__ == "__main__":
-    main_cli()
+    while True:
+        print("\nВыберите режим:")
+        print("1 — CLI")
+        print("2 — GUI")
+        print("Enter — выход\n")
+
+        choice = input("Ваш выбор: ").strip()
+
+        if choice == "1":
+            main_cli()
+        elif choice == "2":
+            main_gui()
+        elif choice == "":
+            break
+        else:
+            print("Неверный ввод.\n")

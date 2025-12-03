@@ -7,7 +7,6 @@ from datetime import datetime
 from typing import Dict, List, Optional, Callable
 from dataclasses import dataclass
 
-
 @dataclass
 class PriceData:
     """Данные о цене токена на бирже"""
@@ -68,6 +67,9 @@ class ExchangeMonitor:
         """
         if exchange_name == "hyperliquid":
             symbol = symbol.upper().replace("USDT", "USDC")
+
+        if exchange_name == "mexc":
+            symbol = symbol + ":USDT"
 
         exchange = None
         try:
