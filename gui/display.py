@@ -1,480 +1,1099 @@
+"""
+GUI арбитражного монитора v3
+- Фиксированные строки пар, drag & drop для сортировки
+- Фандинг: числа со знаком (-0.45 / +0.45), цвет по логике позиции
+- Колонка FUND RESULT вместо ИТОГО
+- Обновление только данных ячеек (без пересоздания строк)
+- Throttle: рендерим не чаще 30 fps
+"""
 import sys
-from typing import List, Dict, Optional
+import asyncio
+import datetime
+import json
+import os
+from typing import List, Optional, Dict
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QMimeData
+from PyQt5.QtGui import QFont, QColor, QDrag
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
     QHeaderView, QCheckBox, QDialog, QDialogButtonBox, QScrollArea,
-    QStackedWidget, QLayout
+    QFrame, QSpinBox, QSplitter, QAbstractItemView, QDoubleSpinBox,
+    QFileDialog,
 )
 
-from core.exchange import ExchangeMonitor, PriceData
+from core.exchange import (
+    ExchangeMonitor, SpreadEntry, TickerData,
+    EXCHANGE_CONFIGS, EXCHANGE_LABELS,
+    source_label, FUND_SHOW_THRESHOLD,
+)
 from main import EXCHANGES as DEFAULT_EXCHANGES
 
-import os
 os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
-os.environ["QT_SCALE_FACTOR"] = "1.25"
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Конфиг (сохраняется рядом с main.py)
+# ══════════════════════════════════════════════════════════════════════════════
+
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.json")
+
+def load_config() -> dict:
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_config(data: dict):
+    try:
+        # Мержим с существующим конфигом чтобы не затирать другие ключи
+        existing = load_config()
+        existing.update(data)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Config save error: {e}")
 
 
-DARK_STYLESHEET = """
-QMainWindow, QWidget {
-    background-color: #151821;
-    color: #f3f3f5;
-    font-size: 13px;
+# ══════════════════════════════════════════════════════════════════════════════
+#  Звуковой сигнал
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AudioAlert:
+    """Воспроизводит mp3/wav через pygame.mixer. Не блокирует UI."""
+
+    def __init__(self):
+        self._ready = False
+        self._sound_path: Optional[str] = None
+        try:
+            import pygame
+            pygame.mixer.init()
+            self._pygame = pygame
+            self._ready = True
+        except Exception as e:
+            print(f"AudioAlert: pygame недоступен — {e}")
+
+    def set_file(self, path: str):
+        self._sound_path = path
+
+    def play(self):
+        if not self._ready or not self._sound_path:
+            return
+        if not os.path.isfile(self._sound_path):
+            return
+        try:
+            self._pygame.mixer.music.load(self._sound_path)
+            self._pygame.mixer.music.play()
+        except Exception as e:
+            print(f"AudioAlert play error: {e}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Цвета
+# ══════════════════════════════════════════════════════════════════════════════
+
+C = {
+    "bg":       "#0d0f14",
+    "bg2":      "#13161e",
+    "bg3":      "#1a1e2a",
+    "border":   "#252a38",
+    "text":     "#d6dae8",
+    "muted":    "#5a607a",
+    "accent":   "#4f8ef7",
+    "green":    "#3de8a0",
+    "green_bg": "#0b1f16",
+    "red":      "#f75f6e",
+    "red_bg":   "#200d10",
+    "yellow":   "#f7c94f",
+    "header":   "#1e2233",
+    "row_alt":  "#111520",
+    "select":   "#1e2d4a",
 }
-QPushButton {
-    background-color: #2a2f3c;
-    color: #f3f3f5;
-    border: 1px solid #3c4456;
-    padding: 5px 9px;
-    border-radius: 5px;
-}
-QPushButton:hover {
-    background-color: #343b4a;
-}
-QTableWidget {
-    background-color: #191d27;
-    alternate-background-color: #202533;
-    gridline-color: #32384a;
-    color: #f3f3f5;
-    selection-background-color: #343b4a;
-    selection-color: #ffffff;
-}
-QHeaderView::section {
-    background-color: #202533;
-    color: #f3f3f5;
-    padding: 3px 5px;
-    border: none;
-    border-bottom: 1px solid #32384a;
-    font-weight: 500;
-}
-QLineEdit {
-    background-color: #191d27;
-    color: #ffffff;
-    padding: 6px;
+
+SS = f"""
+QMainWindow, QWidget {{
+    background-color: {C['bg']};
+    color: {C['text']};
+    font-family: 'JetBrains Mono', 'Consolas', 'Courier New', monospace;
+    font-size: 12px;
+}}
+QPushButton {{
+    background-color: {C['bg3']};
+    color: {C['text']};
+    border: 1px solid {C['border']};
+    padding: 6px 14px;
     border-radius: 4px;
-    border: 1px solid #3c4456;
-}
-QLineEdit:focus {
-    border: 1px solid #5b79ff;
-}
-QScrollArea {
+}}
+QPushButton:hover {{ background-color: {C['border']}; }}
+QPushButton#accent {{
+    background-color: {C['accent']};
+    color: #fff;
     border: none;
-}
+    font-weight: bold;
+}}
+QPushButton#accent:hover {{ background-color: #3a7de0; }}
+QTableWidget {{
+    background-color: {C['bg2']};
+    alternate-background-color: {C['row_alt']};
+    gridline-color: {C['border']};
+    color: {C['text']};
+    border: 1px solid {C['border']};
+    selection-background-color: {C['select']};
+}}
+QHeaderView::section {{
+    background-color: {C['header']};
+    color: {C['muted']};
+    padding: 5px 8px;
+    border: none;
+    border-bottom: 1px solid {C['border']};
+    font-size: 11px;
+    letter-spacing: 1px;
+}}
+QLineEdit {{
+    background-color: {C['bg3']};
+    color: #fff;
+    padding: 7px 12px;
+    border-radius: 4px;
+    border: 1px solid {C['border']};
+    font-size: 14px;
+}}
+QLineEdit:focus {{ border: 1px solid {C['accent']}; }}
+QScrollBar:vertical {{
+    background: {C['bg']};
+    width: 6px;
+    border: none;
+}}
+QScrollBar::handle:vertical {{
+    background: {C['border']};
+    border-radius: 3px;
+    min-height: 20px;
+}}
+QLabel#title {{
+    font-size: 17px;
+    font-weight: bold;
+    color: {C['accent']};
+    letter-spacing: 2px;
+}}
+QLabel#sub {{
+    font-size: 11px;
+    color: {C['muted']};
+}}
+QLabel#ok  {{ color: {C['green']}; font-size: 11px; }}
+QLabel#err {{ color: {C['red']};   font-size: 11px; }}
+QFrame#sep {{
+    background-color: {C['border']};
+    max-height: 1px;
+}}
+QCheckBox {{ spacing: 6px; }}
+QCheckBox::indicator {{
+    width: 14px; height: 14px;
+    border: 1px solid {C['border']};
+    border-radius: 3px;
+    background: {C['bg3']};
+}}
+QCheckBox::indicator:checked {{
+    background: {C['accent']};
+    border-color: {C['accent']};
+}}
+QSpinBox {{
+    background: {C['bg3']};
+    color: {C['text']};
+    border: 1px solid {C['border']};
+    padding: 4px 8px;
+    border-radius: 4px;
+}}
+QDialog {{ background-color: {C['bg2']}; }}
 """
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  Рабочий поток
+# ══════════════════════════════════════════════════════════════════════════════
 
-def normalize_symbol(text: str) -> str:
-    """
-    Приводит пользовательский ввод к формату BASE/QUOTE.
+class MonitorWorker(QThread):
+    updated = pyqtSignal()
+    err     = pyqtSignal(str)
 
-    Args:
-        text: строка вида "BTCUSDT" или "BTC/USDT"
-
-    Returns:
-        Стандартизированный символ (например, BTC/USDT)
-    """
-    text = text.strip().upper()
-    if not text:
-        return ""
-    if "/" in text:
-        base, quote = text.split("/", 1)
-        return f"{base.strip()}/{quote.strip()}"
-    if text.endswith("USDT"):
-        base = text[:-4]
-        return f"{base}/USDT"
-    return text
-
-
-class ExchangeWorker(QThread):
-    """
-    Асинхронный воркер для получения обновлений цены от нескольких бирж.
-    """
-
-    price_updated = pyqtSignal(str, object)
-    error_signal = pyqtSignal(str)
-
-    def __init__(self, symbol: str, exchanges: List[str], parent=None):
-        super().__init__(parent)
-        self.symbol = symbol
+    def __init__(self, base: str, exchanges: List[str], top_n: int = 50):
+        super().__init__()
+        self.base = base
         self.exchanges = exchanges
+        self.top_n = top_n
         self.monitor: Optional[ExchangeMonitor] = None
-        self._loop = None
 
     def run(self):
-        """
-        Инициализирует asyncio-цикл и запускает мониторинг бирж.
-        """
-        import asyncio
-
-        async def main():
-            self.monitor = ExchangeMonitor(self.exchanges)
-
-            def on_update(exchange_name: str, data: PriceData):
-                self.price_updated.emit(exchange_name, data)
-
-            self.monitor.register_callback(on_update)
-
-            try:
-                await self.monitor.start(self.symbol)
-            except Exception as e:
-                self.error_signal.emit(str(e))
-
         loop = asyncio.new_event_loop()
-        self._loop = loop
         asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(main())
-        finally:
-            loop.run_until_complete(loop.shutdown_asyncgens())
-            loop.close()
 
-    def stop(self):
-        """
-        Останавливает мониторинг и завершает рабочий поток.
-        """
-        if self.monitor and self._loop:
+        self.monitor = ExchangeMonitor(
+            exchanges=self.exchanges,
+            on_update=self.updated.emit,
+            top_n=self.top_n,
+        )
+        try:
+            loop.run_until_complete(self.monitor.start(self.base))
+        except Exception as e:
+            self.err.emit(str(e))
+        finally:
             try:
-                self.monitor.stop()
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.close()
             except Exception:
                 pass
 
+    def stop(self):
+        if self.monitor:
+            self.monitor.stop()
+        self.quit()
+        self.wait(3000)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Таблица спредов с drag & drop
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Колонки
+C_BUY    = 0   # Купить (LONG)
+C_SELL   = 1   # Продать (SHORT)
+C_SPREAD = 2   # Спред %
+C_F_BUY  = 3   # Фандинг LONG
+C_F_SELL = 4   # Фандинг SHORT
+C_FUND_R = 5   # Fund Result
+
+SPREAD_HEADERS = [
+    "КУПИТЬ  (LONG)",
+    "ПРОДАТЬ  (SHORT)",
+    "СПРЕД %",
+    "FUND LONG",
+    "FUND SHORT",
+    "FUND RESULT",
+]
+
+
+def _mk(text: str, align=Qt.AlignCenter) -> QTableWidgetItem:
+    it = QTableWidgetItem(str(text))
+    it.setTextAlignment(align | Qt.AlignVCenter)
+    return it
+
+
+def _clr(item: QTableWidgetItem, fg: str, bg: Optional[str] = None):
+    item.setForeground(QColor(fg))
+    if bg:
+        item.setBackground(QColor(bg))
+    return item
+
+
+class SpreadTableWidget(QTableWidget):
+    """
+    QTableWidget с drag & drop строк.
+    После перетаскивания вызывает on_reorder(new_key_order).
+    """
+    row_moved = pyqtSignal(list)   # список pair_key в новом порядке
+
+    def __init__(self):
+        super().__init__(0, 6)
+        self.setHorizontalHeaderLabels(SPREAD_HEADERS)
+        self.verticalHeader().setVisible(False)
+        self.setAlternatingRowColors(True)
+        self.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.setSelectionBehavior(QTableWidget.SelectRows)
+        self.setShowGrid(True)
+        self.setSortingEnabled(False)
+
+        # Drag & drop
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.InternalMove)
+        self.setDropIndicatorShown(True)
+
+        hdr = self.horizontalHeader()
+        hdr.setSectionResizeMode(C_BUY,    QHeaderView.Stretch)
+        hdr.setSectionResizeMode(C_SELL,   QHeaderView.Stretch)
+        hdr.setSectionResizeMode(C_SPREAD, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(C_F_BUY,  QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(C_F_SELL, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(C_FUND_R, QHeaderView.ResizeToContents)
+        self.verticalHeader().setDefaultSectionSize(26)
+
+        self._key_column = 6   # храним pair_key в UserRole ячейки col 0
+
+        # Сортировка по клику на заголовок (только для col 0, 1, 2)
+        self._sort_col: int = -1      # -1 = нет сортировки
+        self._sort_asc: bool = True
+        hdr2 = self.horizontalHeader()
+        hdr2.setSectionsClickable(True)
+        hdr2.sectionClicked.connect(self._on_header_click)
+        # Визуальная стрелка
+        hdr2.setSortIndicatorShown(True)
+        hdr2.setSortIndicator(-1, Qt.AscendingOrder)
+
+    def dropEvent(self, event):
+        """
+        Переопределяем полностью — стандартный InternalMove в QTableWidget
+        удаляет строку-цель при перетаскивании на неё. Делаем swap вручную.
+        """
+        src_row = self.currentRow()
+        if src_row < 0:
+            event.ignore()
+            return
+
+        # Определяем целевую строку по позиции курсора
+        dest_row = self.rowAt(event.pos().y())
+        if dest_row < 0:
+            dest_row = self.rowCount() - 1  # бросили ниже последней строки
+
+        if src_row == dest_row:
+            event.ignore()
+            return
+
+        # Считываем данные обеих строк
+        def read_row(r):
+            cells = []
+            for c in range(self.columnCount()):
+                it = self.item(r, c)
+                if it:
+                    bg_brush = it.background()
+                    bg = bg_brush.color().name() if bg_brush.style() != Qt.NoBrush else None
+                    fg_brush = it.foreground()
+                    fg = fg_brush.color().name() if fg_brush.style() != Qt.NoBrush else None
+                    cells.append({
+                        "text":  it.text(),
+                        "fg":    fg,
+                        "bg":    bg,
+                        "role":  it.data(Qt.UserRole),
+                        "align": it.textAlignment(),
+                    })
+                else:
+                    cells.append(None)
+            return cells
+
+        def write_row(r, cells):
+            for c, cell in enumerate(cells):
+                if cell is None:
+                    continue
+                it = self.item(r, c)
+                if it is None:
+                    it = QTableWidgetItem()
+                    self.setItem(r, c, it)
+                it.setText(cell["text"])
+                if cell["fg"] is not None:
+                    it.setForeground(QColor(cell["fg"]))
+                else:
+                    it.setData(Qt.ForegroundRole, None)  # сброс в дефолт
+                if cell["bg"] is not None:
+                    it.setBackground(QColor(cell["bg"]))
+                else:
+                    it.setData(Qt.BackgroundRole, None)
+                it.setTextAlignment(cell["align"])
+                if cell["role"] is not None:
+                    it.setData(Qt.UserRole, cell["role"])
+
+        # Читаем все строки между src и dest и сдвигаем
+        self.setUpdatesEnabled(False)
+
+        if src_row < dest_row:
+            # Тащим вниз: src уходит на dest, остальные сдвигаются вверх
+            moved = read_row(src_row)
+            for r in range(src_row, dest_row):
+                write_row(r, read_row(r + 1))
+            write_row(dest_row, moved)
+        else:
+            # Тащим вверх: src уходит на dest, остальные сдвигаются вниз
+            moved = read_row(src_row)
+            for r in range(src_row, dest_row, -1):
+                write_row(r, read_row(r - 1))
+            write_row(dest_row, moved)
+
+        self.setUpdatesEnabled(True)
+        self.setCurrentCell(dest_row, 0)
+        event.accept()
+
+        # Уведомляем о новом порядке
+        keys = []
+        for r in range(self.rowCount()):
+            it = self.item(r, C_BUY)
+            if it:
+                key = it.data(Qt.UserRole)
+                if key:
+                    keys.append(key)
+        self.row_moved.emit(keys)
+
+    def _on_header_click(self, col: int):
+        """Сортировка по col 0 (buy), 1 (sell), 2 (spread). Остальные игнорируем."""
+        if col not in (C_BUY, C_SELL, C_SPREAD):
+            return
+
+        if self._sort_col == col:
+            self._sort_asc = not self._sort_asc   # переключаем направление
+        else:
+            self._sort_col = col
+            self._sort_asc = True
+
+        self.horizontalHeader().setSortIndicator(
+            col, Qt.AscendingOrder if self._sort_asc else Qt.DescendingOrder
+        )
+        self._apply_sort()
+
+    def _apply_sort(self):
+        """Физически переставляет строки по текущему sort_col / sort_asc."""
+        if self._sort_col < 0:
+            return
+
+        n = self.rowCount()
+        if n < 2:
+            return
+
+        # Читаем строки. pair_key хранится только в col 0 UserRole.
+        rows_data = []
+        for r in range(n):
+            buy_it = self.item(r, C_BUY)
+            pair_key = buy_it.data(Qt.UserRole) if buy_it else ""
+
+            if self._sort_col == C_BUY:
+                sort_key = buy_it.text() if buy_it else ""
+            elif self._sort_col == C_SELL:
+                it = self.item(r, C_SELL)
+                sort_key = it.text() if it else ""
+            else:  # C_SPREAD — числовая
+                it = self.item(r, C_SPREAD)
+                txt = it.text() if it else "0"
+                try:
+                    sort_key = float(txt.replace("%", "").replace("+", ""))
+                except ValueError:
+                    sort_key = 0.0
+
+            # Копируем все ячейки строки
+            cells = []
+            for c in range(self.columnCount()):
+                it = self.item(r, c)
+                if it:
+                    bg_brush = it.background()
+                    bg = bg_brush.color().name() if bg_brush.style() != Qt.NoBrush else None
+                    fg_brush = it.foreground()
+                    fg = fg_brush.color().name() if fg_brush.style() != Qt.NoBrush else None
+                    cells.append({
+                        "text":  it.text(),
+                        "fg":    fg,
+                        "bg":    bg,
+                        "role":  it.data(Qt.UserRole),
+                        "align": it.textAlignment(),
+                    })
+                else:
+                    cells.append(None)
+
+            rows_data.append((sort_key, pair_key, cells))
+
+        rows_data.sort(key=lambda x: x[0], reverse=not self._sort_asc)
+
+        # Перезаписываем данные в ячейках в новом порядке.
+        # Важно: НЕ вызываем setItem для существующих ячеек (owned error).
+        # Всегда пишем pair_key в col 0 UserRole — он единственный маркер строки.
+        self.setUpdatesEnabled(False)
+        for r, (_, pair_key, cells) in enumerate(rows_data):
+            for c, cell in enumerate(cells):
+                it = self.item(r, c)
+                if it is None:
+                    it = QTableWidgetItem()
+                    self.setItem(r, c, it)
+                if cell is not None:
+                    it.setText(cell["text"])
+                    if cell["fg"] is not None:
+                        it.setForeground(QColor(cell["fg"]))
+                    else:
+                        it.setData(Qt.ForegroundRole, None)  # сброс в дефолт
+                    if cell["bg"] is not None:
+                        it.setBackground(QColor(cell["bg"]))
+                    else:
+                        it.setData(Qt.BackgroundRole, None)
+                    it.setTextAlignment(cell["align"])
+                    if c == C_BUY:
+                        it.setData(Qt.UserRole, pair_key)
+                else:
+                    it.setText("")
+        self.setUpdatesEnabled(True)
+
+        # Уведомляем о новом порядке
+        new_order = []
+        for r in range(self.rowCount()):
+            it = self.item(r, C_BUY)
+            if it:
+                key = it.data(Qt.UserRole)
+                if key:
+                    new_order.append(key)
+        self.row_moved.emit(new_order)
+
+
+class SpreadPanel(QWidget):
+    def __init__(self):
+        super().__init__()
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self.table = SpreadTableWidget()
+        lay.addWidget(self.table)
+
+        # pair_key → row index
+        self._row_index: Dict[str, int] = {}
+
+    def update_pairs(self, pairs: List[SpreadEntry]):
+        """
+        Добавляет новые строки, обновляет существующие.
+        Строки никогда не удаляются и не перемещаются автоматически.
+        """
+        table = self.table
+
+        for entry in pairs:
+            if not entry.should_show():
+                continue
+
+            key = entry.pair_key
+
+            # Создаём строку если её нет
+            if key not in self._row_index:
+                row = table.rowCount()
+                table.insertRow(row)
+                self._row_index[key] = row
+
+                # Сохраняем pair_key в UserRole col 0
+                buy_item = _mk(entry.buy_source, Qt.AlignLeft)
+                buy_item.setData(Qt.UserRole, key)
+                table.setItem(row, C_BUY, buy_item)
+                table.setItem(row, C_SELL,   _mk(entry.sell_source, Qt.AlignLeft))
+                table.setItem(row, C_SPREAD, _mk(""))
+                table.setItem(row, C_F_BUY,  _mk(""))
+                table.setItem(row, C_F_SELL, _mk(""))
+                table.setItem(row, C_FUND_R, _mk(""))
+
+            # Находим текущую строку (могла сдвинуться при drag)
+            row = self._find_row(key)
+            if row < 0:
+                continue
+
+            # Обновляем только значения
+            self._set_spread(row, entry)
+
+        # Синхронизируем _row_index после возможных drag & drop
+        self._sync_index()
+
+    def _find_row(self, key: str) -> int:
+        """Ищем строку по UserRole (drag & drop сдвигает индексы)"""
+        for r in range(self.table.rowCount()):
+            it = self.table.item(r, C_BUY)
+            if it and it.data(Qt.UserRole) == key:
+                return r
+        return -1
+
+    def _sync_index(self):
+        self._row_index.clear()
+        for r in range(self.table.rowCount()):
+            it = self.table.item(r, C_BUY)
+            if it:
+                key = it.data(Qt.UserRole)
+                if key:
+                    self._row_index[key] = r
+
+    def _set_spread(self, row: int, e: SpreadEntry):
+        """
+        Обновляет ячейки строки. Правило PyQt5:
+        setItem вызываем ТОЛЬКО если item is None (новый элемент).
+        Для существующих — только setText/setForeground, иначе:
+        'cannot insert an item that is already owned by another QTableWidget'
+        """
+        t = self.table
+
+        def cell(col: int, fallback: str = "") -> QTableWidgetItem:
+            it = t.item(row, col)
+            if it is None:
+                it = _mk(fallback)
+                t.setItem(row, col, it)
+            return it
+
+        # СПРЕД
+        sp_it = cell(C_SPREAD)
+        sp_it.setText(f"{e.spread_pct:+.4f}%")
+        if e.spread_pct >= 1.0:
+            _clr(sp_it, "#ffffff", C["green_bg"])
+        elif e.spread_pct >= 0.3:
+            _clr(sp_it, C["yellow"], None)
+        elif e.spread_pct > 0:
+            _clr(sp_it, C["text"], None)
+        else:
+            _clr(sp_it, C["muted"], None)
+
+        # FUND LONG (buy side): funding < 0 => зелёный (на long получаем)
+        fb = e.buy_funding
+        fb_it = cell(C_F_BUY)
+        if fb is not None:
+            fb_it.setText(f"{fb:+.4f}%")
+            _clr(fb_it, C["green"] if fb < 0 else C["red"], None)
+        else:
+            fb_it.setText("—")
+            _clr(fb_it, C["muted"], None)
+
+        # FUND SHORT (sell side): funding > 0 => зелёный (на short получаем)
+        fs = e.sell_funding
+        fs_it = cell(C_F_SELL)
+        if fs is not None:
+            fs_it.setText(f"{fs:+.4f}%")
+            _clr(fs_it, C["green"] if fs > 0 else C["red"], None)
+        else:
+            fs_it.setText("—")
+            _clr(fs_it, C["muted"], None)
+
+        # FUND RESULT
+        fr = e.fund_result
+        fr_it = cell(C_FUND_R)
+        if fr is not None:
+            fr_it.setText(f"{fr:+.4f}%")
+            if fr > 0:
+                _clr(fr_it, C["green"], C["green_bg"])
+            elif fr < 0:
+                _clr(fr_it, C["red"], C["red_bg"])
+            else:
+                _clr(fr_it, C["muted"], None)
+        else:
+            fr_it.setText("—")
+            _clr(fr_it, C["muted"], None)
+
+    def current_key_order(self) -> List[str]:
+        order = []
+        for r in range(self.table.rowCount()):
+            it = self.table.item(r, C_BUY)
+            if it:
+                key = it.data(Qt.UserRole)
+                if key:
+                    order.append(key)
+        return order
+
+    def clear_all(self):
+        self.table.setRowCount(0)
+        self._row_index.clear()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Таблица статусов источников
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TickerPanel(QWidget):
+    def __init__(self):
+        super().__init__()
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+
+        lbl = QLabel("ИСТОЧНИКИ")
+        lbl.setObjectName("sub")
+        lbl.setContentsMargins(2, 4, 0, 2)
+        lay.addWidget(lbl)
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Источник", "Цена", "Объём 24ч", "Статус"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.Stretch)
+        for c in (1, 2, 3):
+            hdr.setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        self.table.verticalHeader().setDefaultSectionSize(24)
+        lay.addWidget(self.table)
+
+        self._rows: Dict[str, int] = {}
+
+    def update_tickers(self, tickers: Dict[str, TickerData]):
+        for source, td in tickers.items():
+            if source not in self._rows:
+                row = self.table.rowCount()
+                self.table.insertRow(row)
+                self._rows[source] = row
+                lbl = source_label(td.exchange_id, td.market_type)
+                self.table.setItem(row, 0, _mk(lbl, Qt.AlignLeft))
+
+            row = self._rows[source]
+
+            def tcell(col: int) -> QTableWidgetItem:
+                it = self.table.item(row, col)
+                if it is None:
+                    it = _mk("")
+                    self.table.setItem(row, col, it)
+                return it
+
+            # Цена
+            pi = tcell(1)
+            if td.price is not None:
+                pi.setText(f"${td.price:,.4f}")
+                _clr(pi, C["text"])
+            else:
+                pi.setText("—")
+                _clr(pi, C["muted"])
+
+            # Объём
+            vi = tcell(2)
+            if td.volume_24h is not None:
+                vi.setText(f"{td.volume_24h:,.0f}")
+                _clr(vi, C["muted"])
+            else:
+                vi.setText("—")
+                _clr(vi, C["muted"])
+
+            # Статус
+            si = tcell(3)
+            si.setText(td.status)
+            color_map = {
+                "Онлайн":        C["green"],
+                "Ошибка":        C["red"],
+                "Нет пары":      C["muted"],
+                "Подключение…":  C["yellow"],
+                "Ожидание":      C["muted"],
+            }
+            _clr(si, color_map.get(td.status, C["muted"]))
+
+    def clear_all(self):
+        self.table.setRowCount(0)
+        self._rows.clear()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Диалог настроек
+# ══════════════════════════════════════════════════════════════════════════════
 
 class SettingsDialog(QDialog):
-    """
-    Диалоговое окно настроек выбора бирж и поведения окна.
-    """
-
-    def __init__(self, exchanges, enabled, open_in_new_window, parent=None):
+    def __init__(self, exchanges, enabled, top_n, alert_spread, sound_path, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Настройки")
+        self.setMinimumWidth(380)
+        lay = QVBoxLayout(self)
+        lay.setSpacing(8)
 
-        layout = QVBoxLayout(self)
+        lbl = QLabel("Биржи")
+        lbl.setObjectName("sub")
+        lay.addWidget(lbl)
 
-        self.exchange_checkboxes = {}
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setMaximumHeight(260)
         inner = QWidget()
-        inner_layout = QVBoxLayout(inner)
+        il = QVBoxLayout(inner)
+        il.setSpacing(4)
 
+        self._checks: Dict[str, QCheckBox] = {}
         for ex in exchanges:
-            cb = QCheckBox(ex)
+            cfg = EXCHANGE_CONFIGS.get(ex, {})
+            label = EXCHANGE_LABELS.get(ex, ex)
+            types = []
+            if cfg.get("spot"): types.append("SPOT")
+            if cfg.get("perp"): types.append("PERP")
+            cb = QCheckBox(f"{label}  [{', '.join(types)}]")
             cb.setChecked(ex in enabled)
-            self.exchange_checkboxes[ex] = cb
-            inner_layout.addWidget(cb)
+            self._checks[ex] = cb
+            il.addWidget(cb)
 
-        inner_layout.addStretch()
+        il.addStretch()
         scroll.setWidget(inner)
-        layout.addWidget(scroll)
+        lay.addWidget(scroll)
 
-        self.open_new_window = QCheckBox("Открывать токены в новом окне")
-        self.open_new_window.setChecked(open_in_new_window)
-        layout.addWidget(self.open_new_window)
+        sep = QFrame(); sep.setObjectName("sep")
+        lay.addWidget(sep)
+
+        # Макс. строк
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Макс. строк:"))
+        self._top_n = QSpinBox()
+        self._top_n.setRange(5, 200)
+        self._top_n.setValue(top_n)
+        row.addWidget(self._top_n)
+        row.addStretch()
+        lay.addLayout(row)
+
+        sep2 = QFrame(); sep2.setObjectName("sep")
+        lay.addWidget(sep2)
+
+        # Звуковой сигнал
+        alert_lbl = QLabel("Звуковой сигнал")
+        alert_lbl.setObjectName("sub")
+        lay.addWidget(alert_lbl)
+
+        # Порог спреда
+        spread_row = QHBoxLayout()
+        spread_row.addWidget(QLabel("Сигнальный спред:"))
+        self._alert_spread = QDoubleSpinBox()
+        self._alert_spread.setRange(0.0, 100.0)
+        self._alert_spread.setDecimals(2)
+        self._alert_spread.setSingleStep(0.1)
+        self._alert_spread.setSuffix(" %")
+        self._alert_spread.setValue(alert_spread)
+        self._alert_spread.setToolTip("Сигнал сработает если спред ≥ этого значения")
+        spread_row.addWidget(self._alert_spread)
+        spread_row.addStretch()
+        lay.addLayout(spread_row)
+
+        # Путь к звуковому файлу
+        file_row = QHBoxLayout()
+        file_row.addWidget(QLabel("Звуковой файл:"))
+        self._sound_edit = QLineEdit()
+        self._sound_edit.setPlaceholderText("Выберите mp3/wav файл…")
+        self._sound_edit.setText(sound_path or "")
+        self._sound_edit.setReadOnly(True)
+        file_row.addWidget(self._sound_edit, 1)
+        browse_btn = QPushButton("…")
+        browse_btn.setFixedWidth(32)
+        browse_btn.clicked.connect(self._browse_sound)
+        file_row.addWidget(browse_btn)
+        lay.addLayout(file_row)
 
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
-        layout.addWidget(btns)
+        lay.addWidget(btns)
 
-    def get_enabled_exchanges(self):
-        """
-        Возвращает список включённых бирж.
-        """
-        return [k for k, v in self.exchange_checkboxes.items() if v.isChecked()]
+    def _browse_sound(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите звуковой файл", "",
+            "Аудио файлы (*.mp3 *.wav *.ogg);;Все файлы (*)"
+        )
+        if path:
+            self._sound_edit.setText(path)
 
-    def get_open_new_window(self):
-        """
-        Возвращает флаг «открывать в новом окне».
-        """
-        return self.open_new_window.isChecked()
+    def get_enabled(self):      return [k for k, v in self._checks.items() if v.isChecked()]
+    def get_top_n(self):        return self._top_n.value()
+    def get_alert_spread(self): return self._alert_spread.value()
+    def get_sound_path(self):   return self._sound_edit.text().strip()
 
 
-class PriceMonitorWidget(QWidget):
-    """
-    Таблица мониторинга цен:
-    Биржа | Цена | 24ч Объём | Δ % | Обновлено
-    """
+# ══════════════════════════════════════════════════════════════════════════════
+#  Главное окно
+# ══════════════════════════════════════════════════════════════════════════════
 
+class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.worker: Optional[ExchangeWorker] = None
-        self.rows: Dict[str, int] = {}
-        self.exchanges_list: List[str] = []
-        self.current_prices: Dict[str, float] = {}
-        self.baseline_prices: Dict[str, float] = {}
-        self.baseline_ready: bool = False
-        self.seen_exchanges: set[str] = set()
-        self.current_symbol: str = ""
+        self.setWindowTitle("Arbitrage Monitor")
+        self.resize(1200, 720)
+        self.setMinimumSize(900, 500)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 4)
-        layout.setSpacing(4)
+        self._exchanges = list(DEFAULT_EXCHANGES)
+        self._enabled   = list(DEFAULT_EXCHANGES)
+        self._top_n     = 50
+        self._worker: Optional[MonitorWorker] = None
+        self._symbol = ""
+        self._update_count = 0
 
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(
-            ["Биржа", "Цена", "24ч объём", "Δ %", "Обновлено"]
+        # Звуковой сигнал
+        cfg = load_config()
+        self._alert_spread: float = cfg.get("alert_spread", 1.0)
+        self._sound_path:   str   = cfg.get("sound_path", "")
+        self._audio = AudioAlert()
+        self._audio.set_file(self._sound_path)
+        self._alerted: bool = False   # чтобы не спамить сигналом каждый кадр
+
+        # Throttle рендера: максимум 30 fps
+        self._render_timer = QTimer()
+        self._render_timer.setInterval(33)   # ~30 fps
+        self._render_timer.timeout.connect(self._flush_render)
+        self._dirty = False
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(12, 8, 12, 8)
+        root.setSpacing(6)
+
+        # Шапка
+        hdr = QHBoxLayout()
+        t = QLabel("ARBITRAGE MONITOR")
+        t.setObjectName("title")
+        hdr.addWidget(t)
+        hdr.addStretch()
+        self._status = QLabel("Не запущен")
+        self._status.setObjectName("sub")
+        hdr.addWidget(self._status)
+        root.addLayout(hdr)
+
+        sep = QFrame(); sep.setObjectName("sep")
+        root.addWidget(sep)
+
+        # Строка ввода
+        ir = QHBoxLayout()
+        ir.setSpacing(8)
+        self._token = QLineEdit()
+        self._token.setPlaceholderText("Токен: BTC / ETH / BTCUSDT …")
+        self._token.returnPressed.connect(self._start)
+        ir.addWidget(self._token, 1)
+
+        self._btn_start = QPushButton("▶  СТАРТ")
+        self._btn_start.setObjectName("accent")
+        self._btn_start.clicked.connect(self._start)
+        ir.addWidget(self._btn_start)
+
+        self._btn_stop = QPushButton("■  СТОП")
+        self._btn_stop.clicked.connect(self._stop)
+        self._btn_stop.setEnabled(False)
+        ir.addWidget(self._btn_stop)
+
+        self._btn_cfg = QPushButton("⚙  Настройки")
+        self._btn_cfg.clicked.connect(self._settings)
+        ir.addWidget(self._btn_cfg)
+
+        root.addLayout(ir)
+
+        # Счётчик
+        self._upd_lbl = QLabel("")
+        self._upd_lbl.setObjectName("sub")
+        self._upd_lbl.setAlignment(Qt.AlignRight)
+        root.addWidget(self._upd_lbl)
+
+        # Сплиттер
+        splitter = QSplitter(Qt.Horizontal)
+
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 4, 0)
+        ll.setSpacing(3)
+
+        caption = QLabel("СПРЕДЫ  (перетащите строки чтобы упорядочить)")
+        caption.setObjectName("sub")
+        ll.addWidget(caption)
+
+        self._spread_panel = SpreadPanel()
+        self._spread_panel.table.row_moved.connect(self._on_row_moved)
+        ll.addWidget(self._spread_panel)
+        splitter.addWidget(left)
+
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(4, 0, 0, 0)
+        self._ticker_panel = TickerPanel()
+        rl.addWidget(self._ticker_panel)
+        splitter.addWidget(right)
+
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+        root.addWidget(splitter, 1)
+
+        # Подсказка
+        hint = QLabel(
+            "FUND LONG: −фандинг = зелёный (получаем)   "
+            "FUND SHORT: +фандинг = зелёный (получаем)   "
+            "FUND RESULT: чистый P&L за период"
         )
-        self.table.verticalHeader().setVisible(False)
-        self.table.setAlternatingRowColors(True)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        hint.setObjectName("sub")
+        hint.setAlignment(Qt.AlignCenter)
+        root.addWidget(hint)
 
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.resizeSection(0, 60)
+    # ── Управление ─────────────────────────────────────────────────────────────
 
-        for col in range(1, 5):
-            header.setSectionResizeMode(col, QHeaderView.Stretch)
+    def _normalize(self, text: str) -> str:
+        t = text.strip().upper()
+        if not t: return ""
+        if "/" in t: return t.split("/")[0].strip()
+        if t.endswith("USDT"): return t[:-4]
+        return t
 
-        layout.addWidget(self.table)
+    def _start(self):
+        base = self._normalize(self._token.text())
+        if not base:
+            self._status.setText("⚠ Введите токен")
+            return
 
-        self.footer = QLabel("", alignment=Qt.AlignCenter)
-        self.footer.setStyleSheet("color: #a5a9b7; font-size: 11px;")
-        layout.addWidget(self.footer)
+        self._stop()
+        self._symbol = base
+        self._update_count = 0
+        self._spread_panel.clear_all()
+        self._ticker_panel.clear_all()
 
-    def start(self, symbol: str, exchanges: List[str]):
-        """
-        Запускает мониторинг выбранных бирж для указанной торговой пары.
+        self._status.setText(f"▶ {base}  •  подключение…")
+        self._worker = MonitorWorker(base, self._enabled, self._top_n)
+        self._worker.updated.connect(self._mark_dirty)
+        self._worker.err.connect(lambda m: self._status.setText(f"❌ {m[:80]}"))
+        self._worker.start()
 
-        Args:
-            symbol: торговая пара (например, BTC/USDT)
-            exchanges: список задействованных бирж
-        """
-        self.stop()
-        self.current_symbol = symbol
-        self.footer.setText(f"{symbol} FUTURES")
+        self._render_timer.start()
+        self._btn_start.setEnabled(False)
+        self._btn_stop.setEnabled(True)
 
-        self.table.setRowCount(0)
-        self.rows.clear()
+    def _stop(self):
+        self._render_timer.stop()
+        if self._worker:
+            self._worker.stop()
+            self._worker = None
+        self._btn_start.setEnabled(True)
+        self._btn_stop.setEnabled(False)
+        self._status.setText("Остановлен")
 
-        self.exchanges_list = list(exchanges)
-        self.current_prices.clear()
-        self.baseline_prices.clear()
-        self.baseline_ready = False
-        self.seen_exchanges.clear()
+    def _mark_dirty(self):
+        self._dirty = True
 
-        self.worker = ExchangeWorker(symbol, exchanges)
-        self.worker.price_updated.connect(self.on_update)
-        self.worker.start()
+    def _flush_render(self):
+        """Вызывается таймером ~30 fps, рендерит только если есть новые данные"""
+        if not self._dirty:
+            return
+        self._dirty = False
 
-    def stop(self):
-        """
-        Останавливает поток мониторинга.
-        """
-        if self.worker:
-            self.worker.stop()
-            self.worker.quit()
-            self.worker.wait()
-            self.worker = None
+        if not self._worker or not self._worker.monitor:
+            return
 
-    def _get_or_create_item(self, row: int, col: int) -> QTableWidgetItem:
-        """
-        Возвращает ячейку таблицы или создаёт новую.
+        self._update_count += 1
+        now = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        self._upd_lbl.setText(f"#{self._update_count}  {now}")
 
-        Args:
-            row: номер строки
-            col: номер столбца
+        monitor = self._worker.monitor
+        pairs   = monitor.get_pairs_ordered()
+        tickers = monitor.get_tickers()
 
-        Returns:
-            QTableWidgetItem
-        """
-        item = self.table.item(row, col)
-        if item is None:
-            item = QTableWidgetItem()
-            self.table.setItem(row, col, item)
-        return item
+        self._spread_panel.update_pairs(pairs)
+        self._ticker_panel.update_tickers(tickers)
 
-    def on_update(self, exchange: str, data: PriceData):
-        """
-        Обрабатывает обновление данных от биржи и обновляет таблицу.
+        online = sum(1 for td in tickers.values() if td.status == "Онлайн")
+        total  = len(tickers)
+        visible = self._spread_panel.table.rowCount()
+        self._status.setText(
+            f"▶ {self._symbol}  •  {online}/{total} онлайн  •  {visible} пар"
+        )
 
-        Args:
-            exchange: название биржи
-            data: структура с ценой, объёмом и временем
-        """
-        if exchange not in self.rows:
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-            self.rows[exchange] = row
-            ex_item = QTableWidgetItem(exchange.capitalize())
-            self.table.setItem(row, 0, ex_item)
+        # Звуковой сигнал: срабатывает один раз при достижении порога.
+        # Сбрасывается когда все спреды упали ниже порога.
+        if self._alert_spread > 0 and self._sound_path:
+            best = max((p.spread_pct for p in pairs), default=0.0)
+            if best >= self._alert_spread and not self._alerted:
+                self._alerted = True
+                self._audio.play()
+            elif best < self._alert_spread:
+                self._alerted = False   # сброс — при следующем достижении сыграем снова
 
-        row = self.rows[exchange]
-        self.seen_exchanges.add(exchange)
+    def _on_row_moved(self, new_order: List[str]):
+        if self._worker and self._worker.monitor:
+            self._worker.monitor.reorder_pairs(new_order)
 
-        if data.price is not None:
-            price_text = f"{data.price:,.4f}".rstrip("0").rstrip(".")
-            self.current_prices[exchange] = data.price
-        else:
-            price_text = "—"
-        self._get_or_create_item(row, 1).setText(price_text)
-
-        if data.volume is not None:
-            volume_text = f"{data.volume:,.2f}"
-        else:
-            volume_text = "—"
-        self._get_or_create_item(row, 2).setText(volume_text)
-
-        if not self.baseline_ready:
-            if self.exchanges_list and len(self.seen_exchanges) == len(self.exchanges_list):
-                priced = {ex: p for ex, p in self.current_prices.items() if p is not None}
-                if priced:
-                    self.baseline_prices = priced
-                    self.baseline_ready = True
-
-        delta_item = self._get_or_create_item(row, 3)
-        delta_text = "—"
-
-        if self.baseline_ready and data.price is not None:
-            base = self.baseline_prices.get(exchange)
-            if base and base > 0:
-                delta = (data.price - base) / base * 100
-                delta_text = f"{delta:+.4f}%"
-
-        delta_item.setText(delta_text)
-
-        if delta_text != "—":
-            if delta_text.startswith("+"):
-                delta_item.setForeground(QColor("#4de3a1"))
-                delta_item.setBackground(QColor("#12281e"))
-            elif delta_text.startswith("-"):
-                delta_item.setForeground(QColor("#ff6b81"))
-                delta_item.setBackground(QColor("#2a1518"))
-            else:
-                delta_item.setForeground(QColor("#f3f3f5"))
-                delta_item.setBackground(QColor("#252a36"))
-        else:
-            delta_item.setForeground(QColor("#b0b3c1"))
-            delta_item.setBackground(QColor("#252a36"))
-
-        time_item = self._get_or_create_item(row, 4)
-        if data.timestamp:
-            time_item.setText(data.timestamp.strftime("%H:%M:%S"))
-        else:
-            time_item.setText("—")
-
-
-class TokenWindow(QMainWindow):
-    """
-    Окно отображения таблицы мониторинга одной торговой пары.
-    """
-
-    def __init__(self, symbol: str, exchanges: List[str]):
-        super().__init__()
-        self.setWindowTitle(symbol)
-        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-
-        self.monitor = PriceMonitorWidget()
-        self.setCentralWidget(self.monitor.table)
-
-        self.monitor.start(symbol, exchanges)
-        self.monitor.table.resizeColumnsToContents()
-        self.monitor.table.resizeRowsToContents()
-        self.adjustSize()
+    def _settings(self):
+        dlg = SettingsDialog(
+            self._exchanges, self._enabled, self._top_n,
+            self._alert_spread, self._sound_path, self
+        )
+        dlg.setStyleSheet(SS)
+        if dlg.exec_():
+            self._enabled      = dlg.get_enabled()
+            self._top_n        = dlg.get_top_n()
+            self._alert_spread = dlg.get_alert_spread()
+            self._sound_path   = dlg.get_sound_path()
+            self._audio.set_file(self._sound_path)
+            self._alerted = False
+            save_config({
+                "alert_spread": self._alert_spread,
+                "sound_path":   self._sound_path,
+            })
 
     def closeEvent(self, e):
-        """
-        Срабатывает при закрытии окна.
-        """
-        self.monitor.stop()
+        self._stop()
         super().closeEvent(e)
 
 
-class MainWindow(QMainWindow):
-    """
-    Главное окно приложения с вводом токена и открытием мониторинга.
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Crypto monitor")
-        self.resize(420, 120)
-
-        self.exchanges = list(DEFAULT_EXCHANGES)
-        self.enabled = list(DEFAULT_EXCHANGES)
-        self.open_new_window = True
-        self.token_windows: List[TokenWindow] = []
-
-        self.pages = QStackedWidget()
-        self.setCentralWidget(self.pages)
-
-        self.input_page = QWidget()
-        inp = QVBoxLayout(self.input_page)
-        inp.setContentsMargins(12, 12, 12, 12)
-        inp.setSpacing(8)
-
-        self.token_edit = QLineEdit()
-        self.token_edit.setPlaceholderText("Например: BTC/USDT или BTCUSDT")
-        inp.addWidget(self.token_edit)
-
-        btns = QHBoxLayout()
-        self.open_btn = QPushButton("Открыть")
-        self.settings_btn = QPushButton("⚙ Настройки")
-        btns.addWidget(self.open_btn)
-        btns.addWidget(self.settings_btn)
-        inp.addLayout(btns)
-
-        self.pages.addWidget(self.input_page)
-
-        self.monitor_page = QWidget()
-        mlay = QVBoxLayout(self.monitor_page)
-        mlay.setContentsMargins(8, 8, 8, 8)
-        mlay.setSpacing(4)
-
-        self.back_btn = QPushButton("← Назад")
-        self.back_btn.clicked.connect(lambda: self.pages.setCurrentWidget(self.input_page))
-        mlay.addWidget(self.back_btn)
-
-        self.monitor_widget = PriceMonitorWidget()
-        mlay.addWidget(self.monitor_widget)
-
-        self.pages.addWidget(self.monitor_page)
-
-        self.open_btn.clicked.connect(self.open_token)
-        self.settings_btn.clicked.connect(self.show_settings)
-        self.token_edit.returnPressed.connect(self.open_token)
-
-    def open_token(self):
-        """
-        Открывает окно мониторинга выбранного токена.
-        """
-        token = normalize_symbol(self.token_edit.text())
-        if not token:
-            return
-
-        if self.open_new_window:
-            w = TokenWindow(token, self.enabled)
-            w.show()
-            self.token_windows.append(w)
-            w.destroyed.connect(lambda: self.token_windows.remove(w))
-        else:
-            self.monitor_widget.start(token, self.enabled)
-            self.pages.setCurrentWidget(self.monitor_page)
-
-    def show_settings(self):
-        """
-        Открывает окно настроек.
-        """
-        dlg = SettingsDialog(self.exchanges, self.enabled, self.open_new_window, self)
-        if dlg.exec_():
-            self.enabled = dlg.get_enabled_exchanges()
-            self.open_new_window = dlg.get_open_new_window()
-
+# ══════════════════════════════════════════════════════════════════════════════
 
 def run_gui():
-    """
-    Запускает графический интерфейс приложения.
-    """
     app = QApplication(sys.argv)
-
-    font = QFont()
-    font.setPointSize(11)
-    app.setFont(font)
-
-    app.setStyleSheet(DARK_STYLESHEET)
-
+    app.setFont(QFont("Consolas", 11))
+    app.setStyleSheet(SS)
     w = MainWindow()
     w.show()
     sys.exit(app.exec_())
