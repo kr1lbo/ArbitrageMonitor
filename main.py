@@ -20,6 +20,8 @@ EXCHANGES = [
     "bitget",
     "bingx",
     "hyperliquid",
+    "aster",
+    "lighter",
 ]
 
 

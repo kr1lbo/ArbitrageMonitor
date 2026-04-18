@@ -32,6 +32,8 @@ EXCHANGE_CONFIGS: Dict[str, dict] = {
     "bitget":         {"spot": True,  "perp": True,  "funding": True},
     "bingx":          {"spot": True,  "perp": True,  "funding": True},
     "hyperliquid":    {"spot": False, "perp": True,  "funding": True},
+    "aster":          {"spot": True,  "perp": True,  "funding": True},
+    "lighter":        {"spot": True,  "perp": True,  "funding": True},
 }
 
 EXCHANGE_LABELS = {
@@ -45,6 +47,8 @@ EXCHANGE_LABELS = {
     "bitget":         "Bitget",
     "bingx":          "BingX",
     "hyperliquid":    "HyperLiquid",
+    "aster":          "Aster",
+    "lighter":        "Lighter",
 }
 
 
@@ -53,12 +57,14 @@ def source_label(exchange_id: str, market_type: str) -> str:
     return f"{name} {'SPOT' if market_type == 'spot' else 'PERP'}"
 
 
-def make_spot_symbol(base: str) -> str:
+def make_spot_symbol(exchange_id: str, base: str) -> str:
+    if exchange_id in ["lighter", "hyperliquid"]:
+        return f"{base}/USDC"
     return f"{base}/USDT"
 
 
 def make_perp_symbol(exchange_id: str, base: str) -> str:
-    if exchange_id == "hyperliquid":
+    if exchange_id in ["hyperliquid", "lighter"]:
         return f"{base}/USDC:USDC"
     # kucoinfutures использует unified ccxt формат RAVE/USDT:USDT
     # (внутренний id биржи RAVEUSDTM — ccxt конвертирует сам)
@@ -153,7 +159,7 @@ class ExchangeMonitor:
     async def _watch_price(self, exchange_id: str, market_type: str, base: str):
         source = f"{exchange_id}_{market_type}"
         symbol = (
-            make_spot_symbol(base) if market_type == "spot"
+            make_spot_symbol(exchange_id, base) if market_type == "spot"
             else make_perp_symbol(exchange_id, base)
         )
 
@@ -172,8 +178,8 @@ class ExchangeMonitor:
                 cls = getattr(ccxtpro, exchange_id)
                 if market_type == "spot":
                     default_type = "spot"
-                elif exchange_id == "kucoinfutures":
-                    default_type = "future"   # kucoinfutures не поддерживает "swap"
+                elif exchange_id in ["kucoinfutures", "lighter"]:
+                    default_type = "swap" if exchange_id == "lighter" else "future"
                 else:
                     default_type = "swap"
                 opts = {"defaultType": default_type}
@@ -253,7 +259,9 @@ class ExchangeMonitor:
     def _fetch_funding_sync(exchange_id: str, symbol: str) -> Optional[float]:
         try:
             cls = getattr(ccxt_sync, exchange_id)
-            default_type = "future" if exchange_id == "kucoinfutures" else "swap"
+            default_type = "swap" if exchange_id in ["lighter", "hyperliquid"] else \
+                "future" if exchange_id == "kucoinfutures" else "swap"
+
             ex = cls({"enableRateLimit": True, "options": {"defaultType": default_type}})
             fr = ex.fetch_funding_rate(symbol)
             rate = fr.get("fundingRate")
