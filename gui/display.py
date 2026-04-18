@@ -590,11 +590,8 @@ class SpreadPanel(QWidget):
             self._set_spread(row, entry)
 
         self._sync_index()
-        # Переприменяем фильтр к новым строкам
-        self._apply_filter()
-        # Переприменяем сортировку если она активна
-        if self.table._sort_col >= 0:
-            self.table._apply_sort()
+        # Переприменяем фильтр к новым строкам (только скрываем/показываем)
+        # Сортировку НЕ переприменяем — она статична после клика на заголовок
 
     def _find_row(self, key: str) -> int:
         for r in range(self.table.rowCount()):
