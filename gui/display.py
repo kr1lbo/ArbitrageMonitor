@@ -1,10 +1,7 @@
 """
-GUI арбитражного монитора v3
-- Фиксированные строки пар, drag & drop для сортировки
-- Фандинг: числа со знаком (-0.45 / +0.45), цвет по логике позиции
-- Колонка FUND RESULT вместо ИТОГО
-- Обновление только данных ячеек (без пересоздания строк)
-- Throttle: рендерим не чаще 30 fps
+GUI арбитражного монитора v4
+- Сортировка по всем колонкам
+- Фильтр по бирже покупки и продажи
 """
 import sys
 import asyncio
@@ -13,8 +10,8 @@ import json
 import os
 from typing import List, Optional, Dict
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QMimeData
-from PyQt5.QtGui import QFont, QColor, QDrag
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt5.QtGui import QFont, QColor
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
@@ -33,7 +30,7 @@ from main import EXCHANGES as DEFAULT_EXCHANGES
 os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Конфиг (сохраняется рядом с main.py)
+#  Конфиг
 # ══════════════════════════════════════════════════════════════════════════════
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.json")
@@ -47,7 +44,6 @@ def load_config() -> dict:
 
 def save_config(data: dict):
     try:
-        # Мержим с существующим конфигом чтобы не затирать другие ключи
         existing = load_config()
         existing.update(data)
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -61,8 +57,6 @@ def save_config(data: dict):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AudioAlert:
-    """Воспроизводит mp3/wav через pygame.mixer. Не блокирует UI."""
-
     def __init__(self):
         self._ready = False
         self._sound_path: Optional[str] = None
@@ -88,8 +82,9 @@ class AudioAlert:
         except Exception as e:
             print(f"AudioAlert play error: {e}")
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  Цвета
+#  Цвета и стили
 # ══════════════════════════════════════════════════════════════════════════════
 
 C = {
@@ -132,6 +127,14 @@ QPushButton#accent {{
     font-weight: bold;
 }}
 QPushButton#accent:hover {{ background-color: #3a7de0; }}
+QPushButton#clear_btn {{
+    background-color: transparent;
+    color: {C['muted']};
+    border: none;
+    padding: 2px 6px;
+    font-size: 14px;
+}}
+QPushButton#clear_btn:hover {{ color: {C['text']}; }}
 QTableWidget {{
     background-color: {C['bg2']};
     alternate-background-color: {C['row_alt']};
@@ -149,6 +152,11 @@ QHeaderView::section {{
     font-size: 11px;
     letter-spacing: 1px;
 }}
+QHeaderView::section:hover {{
+    background-color: {C['bg3']};
+    color: {C['text']};
+    cursor: pointer;
+}}
 QLineEdit {{
     background-color: {C['bg3']};
     color: #fff;
@@ -158,6 +166,11 @@ QLineEdit {{
     font-size: 14px;
 }}
 QLineEdit:focus {{ border: 1px solid {C['accent']}; }}
+QLineEdit#filter_edit {{
+    font-size: 12px;
+    padding: 4px 8px;
+    background-color: {C['bg2']};
+}}
 QScrollBar:vertical {{
     background: {C['bg']};
     width: 6px;
@@ -174,16 +187,11 @@ QLabel#title {{
     color: {C['accent']};
     letter-spacing: 2px;
 }}
-QLabel#sub {{
-    font-size: 11px;
-    color: {C['muted']};
-}}
+QLabel#sub {{ font-size: 11px; color: {C['muted']}; }}
+QLabel#filter_lbl {{ font-size: 11px; color: {C['muted']}; }}
 QLabel#ok  {{ color: {C['green']}; font-size: 11px; }}
 QLabel#err {{ color: {C['red']};   font-size: 11px; }}
-QFrame#sep {{
-    background-color: {C['border']};
-    max-height: 1px;
-}}
+QFrame#sep {{ background-color: {C['border']}; max-height: 1px; }}
 QCheckBox {{ spacing: 6px; }}
 QCheckBox::indicator {{
     width: 14px; height: 14px;
@@ -195,7 +203,7 @@ QCheckBox::indicator:checked {{
     background: {C['accent']};
     border-color: {C['accent']};
 }}
-QSpinBox {{
+QSpinBox, QDoubleSpinBox {{
     background: {C['bg3']};
     color: {C['text']};
     border: 1px solid {C['border']};
@@ -223,7 +231,6 @@ class MonitorWorker(QThread):
     def run(self):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-
         self.monitor = ExchangeMonitor(
             exchanges=self.exchanges,
             on_update=self.updated.emit,
@@ -248,16 +255,15 @@ class MonitorWorker(QThread):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Таблица спредов с drag & drop
+#  Колонки
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Колонки
-C_BUY    = 0   # Купить (LONG)
-C_SELL   = 1   # Продать (SHORT)
-C_SPREAD = 2   # Спред %
-C_F_BUY  = 3   # Фандинг LONG
-C_F_SELL = 4   # Фандинг SHORT
-C_FUND_R = 5   # Fund Result
+C_BUY    = 0
+C_SELL   = 1
+C_SPREAD = 2
+C_F_BUY  = 3
+C_F_SELL = 4
+C_FUND_R = 5
 
 SPREAD_HEADERS = [
     "КУПИТЬ  (LONG)",
@@ -267,6 +273,9 @@ SPREAD_HEADERS = [
     "FUND SHORT",
     "FUND RESULT",
 ]
+
+# Числовые колонки (для правильной сортировки)
+NUMERIC_COLS = {C_SPREAD, C_F_BUY, C_F_SELL, C_FUND_R}
 
 
 def _mk(text: str, align=Qt.AlignCenter) -> QTableWidgetItem:
@@ -282,12 +291,19 @@ def _clr(item: QTableWidgetItem, fg: str, bg: Optional[str] = None):
     return item
 
 
+def _parse_pct(text: str) -> float:
+    try:
+        return float(text.replace("%", "").replace("+", "").strip())
+    except ValueError:
+        return 0.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Таблица спредов
+# ══════════════════════════════════════════════════════════════════════════════
+
 class SpreadTableWidget(QTableWidget):
-    """
-    QTableWidget с drag & drop строк.
-    После перетаскивания вызывает on_reorder(new_key_order).
-    """
-    row_moved = pyqtSignal(list)   # список pair_key в новом порядке
+    row_moved = pyqtSignal(list)
 
     def __init__(self):
         super().__init__(0, 6)
@@ -299,7 +315,6 @@ class SpreadTableWidget(QTableWidget):
         self.setShowGrid(True)
         self.setSortingEnabled(False)
 
-        # Drag & drop
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
         self.setDragDropMode(QAbstractItemView.InternalMove)
@@ -314,51 +329,39 @@ class SpreadTableWidget(QTableWidget):
         hdr.setSectionResizeMode(C_FUND_R, QHeaderView.ResizeToContents)
         self.verticalHeader().setDefaultSectionSize(26)
 
-        self._key_column = 6   # храним pair_key в UserRole ячейки col 0
-
-        # Сортировка по клику на заголовок (только для col 0, 1, 2)
-        self._sort_col: int = -1      # -1 = нет сортировки
+        self._sort_col: int = -1
         self._sort_asc: bool = True
-        hdr2 = self.horizontalHeader()
-        hdr2.setSectionsClickable(True)
-        hdr2.sectionClicked.connect(self._on_header_click)
-        # Визуальная стрелка
-        hdr2.setSortIndicatorShown(True)
-        hdr2.setSortIndicator(-1, Qt.AscendingOrder)
+        hdr.setSectionsClickable(True)
+        hdr.sectionClicked.connect(self._on_header_click)
+        hdr.setSortIndicatorShown(True)
+        hdr.setSortIndicator(-1, Qt.AscendingOrder)
+
+    # ── Drag & drop ───────────────────────────────────────────────────────────
 
     def dropEvent(self, event):
-        """
-        Переопределяем полностью — стандартный InternalMove в QTableWidget
-        удаляет строку-цель при перетаскивании на неё. Делаем swap вручную.
-        """
         src_row = self.currentRow()
         if src_row < 0:
             event.ignore()
             return
 
-        # Определяем целевую строку по позиции курсора
         dest_row = self.rowAt(event.pos().y())
         if dest_row < 0:
-            dest_row = self.rowCount() - 1  # бросили ниже последней строки
-
+            dest_row = self.rowCount() - 1
         if src_row == dest_row:
             event.ignore()
             return
 
-        # Считываем данные обеих строк
         def read_row(r):
             cells = []
             for c in range(self.columnCount()):
                 it = self.item(r, c)
                 if it:
                     bg_brush = it.background()
-                    bg = bg_brush.color().name() if bg_brush.style() != Qt.NoBrush else None
                     fg_brush = it.foreground()
-                    fg = fg_brush.color().name() if fg_brush.style() != Qt.NoBrush else None
                     cells.append({
                         "text":  it.text(),
-                        "fg":    fg,
-                        "bg":    bg,
+                        "fg":    fg_brush.color().name() if fg_brush.style() != Qt.NoBrush else None,
+                        "bg":    bg_brush.color().name() if bg_brush.style() != Qt.NoBrush else None,
                         "role":  it.data(Qt.UserRole),
                         "align": it.textAlignment(),
                     })
@@ -378,7 +381,7 @@ class SpreadTableWidget(QTableWidget):
                 if cell["fg"] is not None:
                     it.setForeground(QColor(cell["fg"]))
                 else:
-                    it.setData(Qt.ForegroundRole, None)  # сброс в дефолт
+                    it.setData(Qt.ForegroundRole, None)
                 if cell["bg"] is not None:
                     it.setBackground(QColor(cell["bg"]))
                 else:
@@ -387,106 +390,68 @@ class SpreadTableWidget(QTableWidget):
                 if cell["role"] is not None:
                     it.setData(Qt.UserRole, cell["role"])
 
-        # Читаем все строки между src и dest и сдвигаем
         self.setUpdatesEnabled(False)
-
         if src_row < dest_row:
-            # Тащим вниз: src уходит на dest, остальные сдвигаются вверх
             moved = read_row(src_row)
             for r in range(src_row, dest_row):
                 write_row(r, read_row(r + 1))
             write_row(dest_row, moved)
         else:
-            # Тащим вверх: src уходит на dest, остальные сдвигаются вниз
             moved = read_row(src_row)
             for r in range(src_row, dest_row, -1):
                 write_row(r, read_row(r - 1))
             write_row(dest_row, moved)
-
         self.setUpdatesEnabled(True)
         self.setCurrentCell(dest_row, 0)
         event.accept()
+        self._emit_order()
 
-        # Уведомляем о новом порядке
-        keys = []
-        for r in range(self.rowCount()):
-            it = self.item(r, C_BUY)
-            if it:
-                key = it.data(Qt.UserRole)
-                if key:
-                    keys.append(key)
-        self.row_moved.emit(keys)
+    # ── Сортировка ────────────────────────────────────────────────────────────
 
     def _on_header_click(self, col: int):
-        """Сортировка по col 0 (buy), 1 (sell), 2 (spread). Остальные игнорируем."""
-        if col not in (C_BUY, C_SELL, C_SPREAD):
-            return
-
         if self._sort_col == col:
-            self._sort_asc = not self._sort_asc   # переключаем направление
+            self._sort_asc = not self._sort_asc
         else:
             self._sort_col = col
             self._sort_asc = True
-
         self.horizontalHeader().setSortIndicator(
             col, Qt.AscendingOrder if self._sort_asc else Qt.DescendingOrder
         )
         self._apply_sort()
 
     def _apply_sort(self):
-        """Физически переставляет строки по текущему sort_col / sort_asc."""
-        if self._sort_col < 0:
-            return
-
         n = self.rowCount()
         if n < 2:
             return
 
-        # Читаем строки. pair_key хранится только в col 0 UserRole.
         rows_data = []
         for r in range(n):
-            buy_it = self.item(r, C_BUY)
+            buy_it   = self.item(r, C_BUY)
             pair_key = buy_it.data(Qt.UserRole) if buy_it else ""
 
-            if self._sort_col == C_BUY:
-                sort_key = buy_it.text() if buy_it else ""
-            elif self._sort_col == C_SELL:
-                it = self.item(r, C_SELL)
-                sort_key = it.text() if it else ""
-            else:  # C_SPREAD — числовая
-                it = self.item(r, C_SPREAD)
-                txt = it.text() if it else "0"
-                try:
-                    sort_key = float(txt.replace("%", "").replace("+", ""))
-                except ValueError:
-                    sort_key = 0.0
+            col_it = self.item(r, self._sort_col)
+            raw    = col_it.text() if col_it else ""
+            sort_key = _parse_pct(raw) if self._sort_col in NUMERIC_COLS else raw.lower()
 
-            # Копируем все ячейки строки
             cells = []
             for c in range(self.columnCount()):
                 it = self.item(r, c)
                 if it:
                     bg_brush = it.background()
-                    bg = bg_brush.color().name() if bg_brush.style() != Qt.NoBrush else None
                     fg_brush = it.foreground()
-                    fg = fg_brush.color().name() if fg_brush.style() != Qt.NoBrush else None
                     cells.append({
                         "text":  it.text(),
-                        "fg":    fg,
-                        "bg":    bg,
+                        "fg":    fg_brush.color().name() if fg_brush.style() != Qt.NoBrush else None,
+                        "bg":    bg_brush.color().name() if bg_brush.style() != Qt.NoBrush else None,
                         "role":  it.data(Qt.UserRole),
                         "align": it.textAlignment(),
                     })
                 else:
                     cells.append(None)
-
             rows_data.append((sort_key, pair_key, cells))
 
         rows_data.sort(key=lambda x: x[0], reverse=not self._sort_asc)
 
-        # Перезаписываем данные в ячейках в новом порядке.
-        # Важно: НЕ вызываем setItem для существующих ячеек (owned error).
-        # Всегда пишем pair_key в col 0 UserRole — он единственный маркер строки.
         self.setUpdatesEnabled(False)
         for r, (_, pair_key, cells) in enumerate(rows_data):
             for c, cell in enumerate(cells):
@@ -499,7 +464,7 @@ class SpreadTableWidget(QTableWidget):
                     if cell["fg"] is not None:
                         it.setForeground(QColor(cell["fg"]))
                     else:
-                        it.setData(Qt.ForegroundRole, None)  # сброс в дефолт
+                        it.setData(Qt.ForegroundRole, None)
                     if cell["bg"] is not None:
                         it.setBackground(QColor(cell["bg"]))
                     else:
@@ -510,73 +475,128 @@ class SpreadTableWidget(QTableWidget):
                 else:
                     it.setText("")
         self.setUpdatesEnabled(True)
+        self._emit_order()
 
-        # Уведомляем о новом порядке
-        new_order = []
+    def _emit_order(self):
+        keys = []
         for r in range(self.rowCount()):
             it = self.item(r, C_BUY)
             if it:
                 key = it.data(Qt.UserRole)
                 if key:
-                    new_order.append(key)
-        self.row_moved.emit(new_order)
+                    keys.append(key)
+        self.row_moved.emit(keys)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Панель спредов (таблица + фильтры)
+# ══════════════════════════════════════════════════════════════════════════════
 
 class SpreadPanel(QWidget):
     def __init__(self):
         super().__init__()
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
+        lay.setSpacing(4)
 
+        # ── Строка фильтров ───────────────────────────────────────────────────
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(6)
+
+        filter_row.addWidget(self._filter_lbl("Купить:"))
+        self._filter_buy = QLineEdit()
+        self._filter_buy.setObjectName("filter_edit")
+        self._filter_buy.setPlaceholderText("Биржа покупки…")
+        self._filter_buy.setClearButtonEnabled(True)
+        self._filter_buy.textChanged.connect(self._apply_filter)
+        filter_row.addWidget(self._filter_buy, 1)
+
+        filter_row.addSpacing(12)
+
+        filter_row.addWidget(self._filter_lbl("Продать:"))
+        self._filter_sell = QLineEdit()
+        self._filter_sell.setObjectName("filter_edit")
+        self._filter_sell.setPlaceholderText("Биржа продажи…")
+        self._filter_sell.setClearButtonEnabled(True)
+        self._filter_sell.textChanged.connect(self._apply_filter)
+        filter_row.addWidget(self._filter_sell, 1)
+
+        self._clear_btn = QPushButton("✕")
+        self._clear_btn.setObjectName("clear_btn")
+        self._clear_btn.setToolTip("Сбросить фильтры")
+        self._clear_btn.clicked.connect(self._clear_filters)
+        filter_row.addWidget(self._clear_btn)
+
+        lay.addLayout(filter_row)
+
+        # ── Таблица ───────────────────────────────────────────────────────────
         self.table = SpreadTableWidget()
         lay.addWidget(self.table)
 
-        # pair_key → row index
         self._row_index: Dict[str, int] = {}
 
-    def update_pairs(self, pairs: List[SpreadEntry]):
-        """
-        Добавляет новые строки, обновляет существующие.
-        Строки никогда не удаляются и не перемещаются автоматически.
-        """
-        table = self.table
+    @staticmethod
+    def _filter_lbl(text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setObjectName("filter_lbl")
+        return lbl
 
+    # ── Фильтрация ────────────────────────────────────────────────────────────
+
+    def _apply_filter(self):
+        buy_q  = self._filter_buy.text().strip().lower()
+        sell_q = self._filter_sell.text().strip().lower()
+
+        for r in range(self.table.rowCount()):
+            buy_it  = self.table.item(r, C_BUY)
+            sell_it = self.table.item(r, C_SELL)
+            buy_txt  = buy_it.text().lower()  if buy_it  else ""
+            sell_txt = sell_it.text().lower() if sell_it else ""
+
+            match = (not buy_q  or buy_q  in buy_txt) and \
+                    (not sell_q or sell_q in sell_txt)
+            self.table.setRowHidden(r, not match)
+
+    def _clear_filters(self):
+        self._filter_buy.clear()
+        self._filter_sell.clear()
+
+    # ── Обновление данных ─────────────────────────────────────────────────────
+
+    def update_pairs(self, pairs: List[SpreadEntry]):
+        table = self.table
         for entry in pairs:
             if not entry.should_show():
                 continue
-
             key = entry.pair_key
 
-            # Создаём строку если её нет
             if key not in self._row_index:
                 row = table.rowCount()
                 table.insertRow(row)
                 self._row_index[key] = row
 
-                # Сохраняем pair_key в UserRole col 0
                 buy_item = _mk(entry.buy_source, Qt.AlignLeft)
                 buy_item.setData(Qt.UserRole, key)
-                table.setItem(row, C_BUY, buy_item)
+                table.setItem(row, C_BUY,    buy_item)
                 table.setItem(row, C_SELL,   _mk(entry.sell_source, Qt.AlignLeft))
                 table.setItem(row, C_SPREAD, _mk(""))
                 table.setItem(row, C_F_BUY,  _mk(""))
                 table.setItem(row, C_F_SELL, _mk(""))
                 table.setItem(row, C_FUND_R, _mk(""))
 
-            # Находим текущую строку (могла сдвинуться при drag)
             row = self._find_row(key)
             if row < 0:
                 continue
-
-            # Обновляем только значения
             self._set_spread(row, entry)
 
-        # Синхронизируем _row_index после возможных drag & drop
         self._sync_index()
+        # Переприменяем фильтр к новым строкам
+        self._apply_filter()
+        # Переприменяем сортировку если она активна
+        if self.table._sort_col >= 0:
+            self.table._apply_sort()
 
     def _find_row(self, key: str) -> int:
-        """Ищем строку по UserRole (drag & drop сдвигает индексы)"""
         for r in range(self.table.rowCount()):
             it = self.table.item(r, C_BUY)
             if it and it.data(Qt.UserRole) == key:
@@ -593,18 +613,12 @@ class SpreadPanel(QWidget):
                     self._row_index[key] = r
 
     def _set_spread(self, row: int, e: SpreadEntry):
-        """
-        Обновляет ячейки строки. Правило PyQt5:
-        setItem вызываем ТОЛЬКО если item is None (новый элемент).
-        Для существующих — только setText/setForeground, иначе:
-        'cannot insert an item that is already owned by another QTableWidget'
-        """
         t = self.table
 
-        def cell(col: int, fallback: str = "") -> QTableWidgetItem:
+        def cell(col: int) -> QTableWidgetItem:
             it = t.item(row, col)
             if it is None:
-                it = _mk(fallback)
+                it = _mk("")
                 t.setItem(row, col, it)
             return it
 
@@ -620,7 +634,7 @@ class SpreadPanel(QWidget):
         else:
             _clr(sp_it, C["muted"], None)
 
-        # FUND LONG (buy side): funding < 0 => зелёный (на long получаем)
+        # FUND LONG
         fb = e.buy_funding
         fb_it = cell(C_F_BUY)
         if fb is not None:
@@ -630,7 +644,7 @@ class SpreadPanel(QWidget):
             fb_it.setText("—")
             _clr(fb_it, C["muted"], None)
 
-        # FUND SHORT (sell side): funding > 0 => зелёный (на short получаем)
+        # FUND SHORT
         fs = e.sell_funding
         fs_it = cell(C_F_SELL)
         if fs is not None:
@@ -671,7 +685,7 @@ class SpreadPanel(QWidget):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Таблица статусов источников
+#  Панель статусов источников
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TickerPanel(QWidget):
@@ -707,8 +721,7 @@ class TickerPanel(QWidget):
                 row = self.table.rowCount()
                 self.table.insertRow(row)
                 self._rows[source] = row
-                lbl = source_label(td.exchange_id, td.market_type)
-                self.table.setItem(row, 0, _mk(lbl, Qt.AlignLeft))
+                self.table.setItem(row, 0, _mk(source_label(td.exchange_id, td.market_type), Qt.AlignLeft))
 
             row = self._rows[source]
 
@@ -719,35 +732,25 @@ class TickerPanel(QWidget):
                     self.table.setItem(row, col, it)
                 return it
 
-            # Цена
             pi = tcell(1)
             if td.price is not None:
                 pi.setText(f"${td.price:,.4f}")
                 _clr(pi, C["text"])
             else:
-                pi.setText("—")
-                _clr(pi, C["muted"])
+                pi.setText("—"); _clr(pi, C["muted"])
 
-            # Объём
             vi = tcell(2)
             if td.volume_24h is not None:
-                vi.setText(f"{td.volume_24h:,.0f}")
-                _clr(vi, C["muted"])
+                vi.setText(f"{td.volume_24h:,.0f}"); _clr(vi, C["muted"])
             else:
-                vi.setText("—")
-                _clr(vi, C["muted"])
+                vi.setText("—"); _clr(vi, C["muted"])
 
-            # Статус
             si = tcell(3)
             si.setText(td.status)
-            color_map = {
-                "Онлайн":        C["green"],
-                "Ошибка":        C["red"],
-                "Нет пары":      C["muted"],
-                "Подключение…":  C["yellow"],
-                "Ожидание":      C["muted"],
-            }
-            _clr(si, color_map.get(td.status, C["muted"]))
+            _clr(si, {
+                "Онлайн": C["green"], "Ошибка": C["red"],
+                "Нет пары": C["muted"], "Подключение…": C["yellow"],
+            }.get(td.status, C["muted"]))
 
     def clear_all(self):
         self.table.setRowCount(0)
@@ -766,16 +769,14 @@ class SettingsDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.setSpacing(8)
 
-        lbl = QLabel("Биржи")
-        lbl.setObjectName("sub")
+        lbl = QLabel("Биржи"); lbl.setObjectName("sub")
         lay.addWidget(lbl)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setMaximumHeight(260)
         inner = QWidget()
-        il = QVBoxLayout(inner)
-        il.setSpacing(4)
+        il = QVBoxLayout(inner); il.setSpacing(4)
 
         self._checks: Dict[str, QCheckBox] = {}
         for ex in exchanges:
@@ -793,28 +794,21 @@ class SettingsDialog(QDialog):
         scroll.setWidget(inner)
         lay.addWidget(scroll)
 
-        sep = QFrame(); sep.setObjectName("sep")
-        lay.addWidget(sep)
+        sep = QFrame(); sep.setObjectName("sep"); lay.addWidget(sep)
 
-        # Макс. строк
         row = QHBoxLayout()
         row.addWidget(QLabel("Макс. строк:"))
         self._top_n = QSpinBox()
         self._top_n.setRange(5, 200)
         self._top_n.setValue(top_n)
-        row.addWidget(self._top_n)
-        row.addStretch()
+        row.addWidget(self._top_n); row.addStretch()
         lay.addLayout(row)
 
-        sep2 = QFrame(); sep2.setObjectName("sep")
-        lay.addWidget(sep2)
+        sep2 = QFrame(); sep2.setObjectName("sep"); lay.addWidget(sep2)
 
-        # Звуковой сигнал
-        alert_lbl = QLabel("Звуковой сигнал")
-        alert_lbl.setObjectName("sub")
+        alert_lbl = QLabel("Звуковой сигнал"); alert_lbl.setObjectName("sub")
         lay.addWidget(alert_lbl)
 
-        # Порог спреда
         spread_row = QHBoxLayout()
         spread_row.addWidget(QLabel("Сигнальный спред:"))
         self._alert_spread = QDoubleSpinBox()
@@ -823,12 +817,9 @@ class SettingsDialog(QDialog):
         self._alert_spread.setSingleStep(0.1)
         self._alert_spread.setSuffix(" %")
         self._alert_spread.setValue(alert_spread)
-        self._alert_spread.setToolTip("Сигнал сработает если спред ≥ этого значения")
-        spread_row.addWidget(self._alert_spread)
-        spread_row.addStretch()
+        spread_row.addWidget(self._alert_spread); spread_row.addStretch()
         lay.addLayout(spread_row)
 
-        # Путь к звуковому файлу
         file_row = QHBoxLayout()
         file_row.addWidget(QLabel("Звуковой файл:"))
         self._sound_edit = QLineEdit()
@@ -879,17 +870,15 @@ class MainWindow(QMainWindow):
         self._symbol = ""
         self._update_count = 0
 
-        # Звуковой сигнал
         cfg = load_config()
         self._alert_spread: float = cfg.get("alert_spread", 1.0)
         self._sound_path:   str   = cfg.get("sound_path", "")
         self._audio = AudioAlert()
         self._audio.set_file(self._sound_path)
-        self._alerted: bool = False   # чтобы не спамить сигналом каждый кадр
+        self._alerted: bool = False
 
-        # Throttle рендера: максимум 30 fps
         self._render_timer = QTimer()
-        self._render_timer.setInterval(33)   # ~30 fps
+        self._render_timer.setInterval(33)
         self._render_timer.timeout.connect(self._flush_render)
         self._dirty = False
 
@@ -901,21 +890,16 @@ class MainWindow(QMainWindow):
 
         # Шапка
         hdr = QHBoxLayout()
-        t = QLabel("ARBITRAGE MONITOR")
-        t.setObjectName("title")
-        hdr.addWidget(t)
-        hdr.addStretch()
-        self._status = QLabel("Не запущен")
-        self._status.setObjectName("sub")
+        t = QLabel("ARBITRAGE MONITOR"); t.setObjectName("title")
+        hdr.addWidget(t); hdr.addStretch()
+        self._status = QLabel("Не запущен"); self._status.setObjectName("sub")
         hdr.addWidget(self._status)
         root.addLayout(hdr)
 
-        sep = QFrame(); sep.setObjectName("sep")
-        root.addWidget(sep)
+        sep = QFrame(); sep.setObjectName("sep"); root.addWidget(sep)
 
-        # Строка ввода
-        ir = QHBoxLayout()
-        ir.setSpacing(8)
+        # Строка ввода токена
+        ir = QHBoxLayout(); ir.setSpacing(8)
         self._token = QLineEdit()
         self._token.setPlaceholderText("Токен: BTC / ETH / BTCUSDT …")
         self._token.returnPressed.connect(self._start)
@@ -934,7 +918,6 @@ class MainWindow(QMainWindow):
         self._btn_cfg = QPushButton("⚙  Настройки")
         self._btn_cfg.clicked.connect(self._settings)
         ir.addWidget(self._btn_cfg)
-
         root.addLayout(ir)
 
         # Счётчик
@@ -971,7 +954,6 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
         root.addWidget(splitter, 1)
 
-        # Подсказка
         hint = QLabel(
             "FUND LONG: −фандинг = зелёный (получаем)   "
             "FUND SHORT: +фандинг = зелёный (получаем)   "
@@ -995,19 +977,16 @@ class MainWindow(QMainWindow):
         if not base:
             self._status.setText("⚠ Введите токен")
             return
-
         self._stop()
         self._symbol = base
         self._update_count = 0
         self._spread_panel.clear_all()
         self._ticker_panel.clear_all()
-
         self._status.setText(f"▶ {base}  •  подключение…")
         self._worker = MonitorWorker(base, self._enabled, self._top_n)
         self._worker.updated.connect(self._mark_dirty)
         self._worker.err.connect(lambda m: self._status.setText(f"❌ {m[:80]}"))
         self._worker.start()
-
         self._render_timer.start()
         self._btn_start.setEnabled(False)
         self._btn_stop.setEnabled(True)
@@ -1025,11 +1004,9 @@ class MainWindow(QMainWindow):
         self._dirty = True
 
     def _flush_render(self):
-        """Вызывается таймером ~30 fps, рендерит только если есть новые данные"""
         if not self._dirty:
             return
         self._dirty = False
-
         if not self._worker or not self._worker.monitor:
             return
 
@@ -1044,22 +1021,23 @@ class MainWindow(QMainWindow):
         self._spread_panel.update_pairs(pairs)
         self._ticker_panel.update_tickers(tickers)
 
-        online = sum(1 for td in tickers.values() if td.status == "Онлайн")
-        total  = len(tickers)
-        visible = self._spread_panel.table.rowCount()
+        online  = sum(1 for td in tickers.values() if td.status == "Онлайн")
+        total   = len(tickers)
+        visible = sum(
+            1 for r in range(self._spread_panel.table.rowCount())
+            if not self._spread_panel.table.isRowHidden(r)
+        )
         self._status.setText(
             f"▶ {self._symbol}  •  {online}/{total} онлайн  •  {visible} пар"
         )
 
-        # Звуковой сигнал: срабатывает один раз при достижении порога.
-        # Сбрасывается когда все спреды упали ниже порога.
         if self._alert_spread > 0 and self._sound_path:
             best = max((p.spread_pct for p in pairs), default=0.0)
             if best >= self._alert_spread and not self._alerted:
                 self._alerted = True
                 self._audio.play()
             elif best < self._alert_spread:
-                self._alerted = False   # сброс — при следующем достижении сыграем снова
+                self._alerted = False
 
     def _on_row_moved(self, new_order: List[str]):
         if self._worker and self._worker.monitor:
