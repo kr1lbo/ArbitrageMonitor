@@ -8,6 +8,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from core.config import async_retry, ccxt_config, format_network_error
+
 # ── Структуры данных ──────────────────────────────────────────────────────────
 
 @dataclass
@@ -196,11 +198,9 @@ async def fetch_historical_spread(
 
     def make(exc_id: str, mkt: str):
         sym  = make_spot_symbol(exc_id, symbol) if mkt == 'spot' else make_perp_symbol(exc_id, symbol)
-        exc  = getattr(ccxt_a, exc_id)({
-            'enableRateLimit': True,
-            'timeout': FETCH_TIMEOUT_MS,
-            'options': exchange_history_options(exc_id, mkt),
-        })
+        exc  = getattr(ccxt_a, exc_id)(
+            ccxt_config(exchange_history_options(exc_id, mkt), timeout=FETCH_TIMEOUT_MS)
+        )
         return exc, sym
 
     buy_exc,  buy_sym  = make(buy_exc_id,  buy_mkt)
@@ -225,7 +225,7 @@ async def fetch_historical_spread(
                     return _compute_spread_bars(buy_raw, sell_raw, TF_MS.get(fetch_tf, 60_000))
                 errors.append(f'{fetch_tf}: пустой ответ')
             except Exception as exc:
-                errors.append(f'{fetch_tf}: {exc}')
+                errors.append(format_network_error(f'{buy_exc_id}/{sell_exc_id}', f'fetch_ohlcv {fetch_tf}', exc))
 
         raise RuntimeError('Не удалось загрузить общую историю OHLCV. ' + ' | '.join(errors))
     finally:
@@ -258,16 +258,7 @@ def exchange_history_options(exc_id: str, mkt: str) -> dict[str, Any]:
 
 
 async def _retry(coro_factory, what: str):
-    last_exc: Exception | None = None
-    for attempt in range(FETCH_RETRIES):
-        try:
-            return await coro_factory()
-        except Exception as exc:
-            last_exc = exc
-            if attempt + 1 < FETCH_RETRIES:
-                await asyncio.sleep(0.5 * (attempt + 1))
-    assert last_exc is not None
-    raise RuntimeError(f'{what}: {last_exc}') from last_exc
+    return await async_retry(coro_factory, what)
 
 
 async def _load_markets_for_history(exchange, exc_id: str, mkt: str) -> None:
@@ -302,7 +293,7 @@ async def _async_fetch_ohlcv(exchange, symbol: str, preferred_tf: str, limit: in
                 return data
             errors.append(f'{tf}: пустой ответ')
         except Exception as exc:
-            errors.append(f'{tf}: {exc}')
+            errors.append(format_network_error(exchange.id, f'fetch_ohlcv {tf}', exc))
 
     raise RuntimeError(f'{exchange.id}: не удалось загрузить OHLCV для {symbol}. ' + ' | '.join(errors))
 
@@ -455,11 +446,9 @@ async def fetch_funding_history(
         return []
     import ccxt.async_support as ccxt_a
     from core.exchange import make_perp_symbol
-    exc  = getattr(ccxt_a, exc_id)({
-        'enableRateLimit': True,
-        'timeout': FETCH_TIMEOUT_MS,
-        'options': exchange_history_options(exc_id, mkt),
-    })
+    exc  = getattr(ccxt_a, exc_id)(
+        ccxt_config(exchange_history_options(exc_id, mkt), timeout=FETCH_TIMEOUT_MS)
+    )
     try:
         sym = make_perp_symbol(exc_id, symbol)
         await _load_markets_for_history(exc, exc_id, _history_market_type(exc_id, mkt))

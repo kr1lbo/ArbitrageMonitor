@@ -26,7 +26,9 @@ EXCHANGES = [
 
 
 def main():
+    from core.config import ensure_config
     from gui.display import run_gui
+    ensure_config()
     run_gui()
 
 

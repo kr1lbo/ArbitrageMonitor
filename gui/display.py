@@ -6,10 +6,9 @@ GUI арбитражного монитора v4
 import sys
 import asyncio
 import datetime
-import json
 import os
 import time
-from typing import List, Optional, Dict
+from typing import Callable, List, Optional, Dict
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont, QColor
@@ -18,7 +17,7 @@ from PyQt5.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
     QHeaderView, QCheckBox, QDialog, QDialogButtonBox, QScrollArea,
     QFrame, QSpinBox, QSplitter, QAbstractItemView, QDoubleSpinBox,
-    QFileDialog,
+    QFileDialog, QTabWidget, QTabBar,
 )
 
 from core.exchange import (
@@ -26,34 +25,13 @@ from core.exchange import (
     EXCHANGE_CONFIGS, EXCHANGE_LABELS,
     source_label, FUND_SHOW_THRESHOLD,
 )
+from core.config import ensure_config, save_config
 from core.history import SpreadHistoryManager
+from core.scanner import ScannerEntry, scan_market
 from gui.history_window import SpreadHistoryWindow, FundingHistoryWindow
 from main import EXCHANGES as DEFAULT_EXCHANGES
 
 os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Конфиг
-# ══════════════════════════════════════════════════════════════════════════════
-
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config.json")
-
-def load_config() -> dict:
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def save_config(data: dict):
-    try:
-        existing = load_config()
-        existing.update(data)
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(existing, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"Config save error: {e}")
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Звуковой сигнал
@@ -256,6 +234,31 @@ class MonitorWorker(QThread):
         self.wait(3000)
 
 
+class ScannerWorker(QThread):
+    done = pyqtSignal(list, list, int)
+
+    def __init__(self, exchanges: List[str], top_n: int = 100):
+        super().__init__()
+        self.exchanges = exchanges
+        self.top_n = top_n
+
+    def run(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        started = int(time.time() * 1000)
+        try:
+            entries, errors = loop.run_until_complete(scan_market(self.exchanges, self.top_n))
+            self.done.emit(entries, errors, started)
+        except Exception as exc:
+            self.done.emit([], [str(exc)[:120]], started)
+        finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            loop.close()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Колонки
 # ══════════════════════════════════════════════════════════════════════════════
@@ -302,6 +305,236 @@ def _parse_pct(text: str) -> float:
         return float(text.replace("%", "").replace("+", "").strip())
     except ValueError:
         return 0.0
+
+
+def _fmt_scan_time(ts_ms: int) -> str:
+    if not ts_ms:
+        return "—"
+    return datetime.datetime.fromtimestamp(ts_ms / 1000).strftime("%H:%M:%S")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Сканер рынка
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ScannerPanel(QWidget):
+    token_opened = pyqtSignal(str)
+
+    C_TOKEN = 0
+    C_POS = 1
+    C_POS_ROUTE = 2
+    C_NEG = 3
+    C_NEG_ROUTE = 4
+    C_FUND = 5
+    C_SOURCES = 6
+    C_UPDATED = 7
+
+    def __init__(self, get_exchanges, get_top_n, parent=None):
+        super().__init__(parent)
+        self._get_exchanges = get_exchanges
+        self._get_top_n = get_top_n
+        self._worker: ScannerWorker | None = None
+        self._running = False
+        self._last_entries: list[ScannerEntry] = []
+        self._sort_col: int = -1
+        self._sort_desc: bool = True
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+
+        top = QHBoxLayout()
+        title = QLabel("СКАНЕР РЫНКА")
+        title.setObjectName("sub")
+        top.addWidget(title)
+        top.addStretch()
+
+        top.addWidget(QLabel("Интервал:"))
+        self._interval = QSpinBox()
+        self._interval.setRange(15, 600)
+        self._interval.setValue(60)
+        self._interval.setSuffix(" сек")
+        top.addWidget(self._interval)
+
+        self._btn_refresh = QPushButton("↻ Обновить")
+        self._btn_refresh.clicked.connect(self._scan_once)
+        top.addWidget(self._btn_refresh)
+
+        self._btn_start = QPushButton("▶ СТАРТ")
+        self._btn_start.setObjectName("accent")
+        self._btn_start.clicked.connect(self.start)
+        top.addWidget(self._btn_start)
+
+        self._btn_stop = QPushButton("■ СТОП")
+        self._btn_stop.clicked.connect(self.stop)
+        self._btn_stop.setEnabled(False)
+        top.addWidget(self._btn_stop)
+        lay.addLayout(top)
+
+        self._status = QLabel("Остановлен")
+        self._status.setObjectName("sub")
+        lay.addWidget(self._status)
+
+        self.table = QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels([
+            "Токен", "+ Спред", "+ Маршрут", "− Спред", "− Маршрут",
+            "Фандинг", "Источники", "Обновлено",
+        ])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSortingEnabled(False)
+        self.table.cellDoubleClicked.connect(self._open_row)
+
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(self.C_TOKEN, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(self.C_POS, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(self.C_POS_ROUTE, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(self.C_NEG, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(self.C_NEG_ROUTE, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(self.C_FUND, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(self.C_SOURCES, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(self.C_UPDATED, QHeaderView.ResizeToContents)
+        hdr.setSectionsClickable(True)
+        hdr.setSortIndicatorShown(True)
+        hdr.sectionClicked.connect(self._on_header_click)
+        self.table.verticalHeader().setDefaultSectionSize(25)
+        lay.addWidget(self.table, 1)
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._scan_once)
+
+    def start(self):
+        self._running = True
+        self._btn_start.setEnabled(False)
+        self._btn_stop.setEnabled(True)
+        self._scan_once()
+        self._timer.start(self._interval.value() * 1000)
+
+    def stop(self):
+        self._running = False
+        self._timer.stop()
+        self._btn_start.setEnabled(True)
+        self._btn_stop.setEnabled(False)
+        self._status.setText("Остановлен")
+
+    def _scan_once(self):
+        if self._worker and self._worker.isRunning():
+            return
+        exchanges = list(self._get_exchanges())
+        if not exchanges:
+            self._status.setText("Нет включённых бирж")
+            return
+        self._status.setText(f"Сканирование {len(exchanges)} бирж…")
+        self._btn_refresh.setEnabled(False)
+        self._worker = ScannerWorker(exchanges, top_n=self._get_top_n())
+        self._worker.done.connect(self._on_scan_done)
+        self._worker.start()
+
+    def _on_scan_done(self, entries: list, errors: list, started_ms: int):
+        self._last_entries = entries
+        self._render_current()
+        self._btn_refresh.setEnabled(True)
+        elapsed = max(0.0, (time.time() * 1000 - started_ms) / 1000)
+        err_txt = f" • ошибок: {len(errors)}" if errors else ""
+        self._status.setText(
+            f"Найдено {len(entries)} токенов • {elapsed:.1f} сек • {datetime.datetime.now().strftime('%H:%M:%S')}{err_txt}"
+        )
+        if self._running:
+            self._timer.start(self._interval.value() * 1000)
+
+    def _on_header_click(self, col: int):
+        if self._sort_col == col:
+            self._sort_desc = not self._sort_desc
+        else:
+            self._sort_col = col
+            self._sort_desc = True
+        self.table.horizontalHeader().setSortIndicator(
+            col, Qt.DescendingOrder if self._sort_desc else Qt.AscendingOrder
+        )
+        self._render_current()
+
+    def _render_current(self):
+        entries = list(self._last_entries)
+        if self._sort_col >= 0:
+            entries.sort(key=self._sort_key, reverse=self._sort_desc)
+        self._render(entries)
+
+    def _sort_key(self, entry: ScannerEntry):
+        if self._sort_col == self.C_TOKEN:
+            return entry.base
+        if self._sort_col == self.C_POS:
+            return entry.pos_spread if entry.pos_spread is not None else float("-inf")
+        if self._sort_col == self.C_POS_ROUTE:
+            return _route(entry.pos_buy_source, entry.pos_sell_source)
+        if self._sort_col == self.C_NEG:
+            return abs(entry.neg_spread) if entry.neg_spread is not None else 0.0
+        if self._sort_col == self.C_NEG_ROUTE:
+            return _route(entry.neg_buy_source, entry.neg_sell_source)
+        if self._sort_col == self.C_FUND:
+            value = _best_funding(entry)
+            return abs(value) if value is not None else 0.0
+        if self._sort_col == self.C_SOURCES:
+            return entry.sources_count
+        if self._sort_col == self.C_UPDATED:
+            return entry.updated_ms
+        return entry.max_abs_spread
+
+    def _render(self, entries: list[ScannerEntry]):
+        self.table.setUpdatesEnabled(False)
+        self.table.setRowCount(0)
+        for entry in entries:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+
+            token = _mk(entry.base, Qt.AlignLeft)
+            token.setData(Qt.UserRole, entry.base)
+            self.table.setItem(row, self.C_TOKEN, token)
+
+            pos = _mk(_fmt_pct(entry.pos_spread))
+            if entry.pos_spread is not None:
+                _clr(pos, C["green"] if entry.pos_spread > 0 else C["muted"], C["green_bg"] if entry.pos_spread >= 1 else None)
+            self.table.setItem(row, self.C_POS, pos)
+            self.table.setItem(row, self.C_POS_ROUTE, _mk(_route(entry.pos_buy_source, entry.pos_sell_source), Qt.AlignLeft))
+
+            neg = _mk(_fmt_pct(entry.neg_spread))
+            if entry.neg_spread is not None:
+                _clr(neg, C["red"] if entry.neg_spread < 0 else C["muted"], C["red_bg"] if entry.neg_spread <= -1 else None)
+            self.table.setItem(row, self.C_NEG, neg)
+            self.table.setItem(row, self.C_NEG_ROUTE, _mk(_route(entry.neg_buy_source, entry.neg_sell_source), Qt.AlignLeft))
+
+            best_funding = _best_funding(entry)
+            fund = _mk(_fmt_pct(best_funding))
+            if best_funding is not None:
+                _clr(fund, C["green"] if best_funding > 0 else C["red"] if best_funding < 0 else C["muted"])
+            self.table.setItem(row, self.C_FUND, fund)
+
+            self.table.setItem(row, self.C_SOURCES, _mk(str(entry.sources_count)))
+            self.table.setItem(row, self.C_UPDATED, _mk(_fmt_scan_time(entry.updated_ms)))
+        self.table.setUpdatesEnabled(True)
+
+    def _open_row(self, row: int, _col: int):
+        item = self.table.item(row, self.C_TOKEN)
+        if item:
+            token = item.data(Qt.UserRole) or item.text()
+            if token:
+                self.token_opened.emit(str(token))
+
+
+def _fmt_pct(value: float | None) -> str:
+    return "—" if value is None else f"{value:+.3f}%"
+
+
+def _route(buy: str, sell: str) -> str:
+    return "—" if not buy or not sell else f"{buy} → {sell}"
+
+
+def _best_funding(entry: ScannerEntry) -> float | None:
+    values = [v for v in (entry.pos_fund_result, entry.neg_fund_result) if v is not None]
+    if not values:
+        return None
+    return max(values, key=lambda v: abs(v))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -797,7 +1030,10 @@ class TickerPanel(QWidget):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SettingsDialog(QDialog):
-    def __init__(self, exchanges, enabled, top_n, alert_spread, sound_path, parent=None):
+    def __init__(
+        self, exchanges, enabled, main_top_n, detail_top_n,
+        alert_spread, sound_path, proxy, websocket_proxy, parent=None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Настройки")
         self.setMinimumWidth(380)
@@ -832,11 +1068,20 @@ class SettingsDialog(QDialog):
         sep = QFrame(); sep.setObjectName("sep"); lay.addWidget(sep)
 
         row = QHBoxLayout()
-        row.addWidget(QLabel("Макс. строк:"))
-        self._top_n = QSpinBox()
-        self._top_n.setRange(5, 200)
-        self._top_n.setValue(top_n)
-        row.addWidget(self._top_n); row.addStretch()
+        row.addWidget(QLabel("Лимит сканера:"))
+        self._main_top_n = QSpinBox()
+        self._main_top_n.setRange(0, 10000)
+        self._main_top_n.setValue(main_top_n)
+        self._main_top_n.setSpecialValueText("Все")
+        row.addWidget(self._main_top_n)
+        row.addSpacing(12)
+        row.addWidget(QLabel("Лимит детально:"))
+        self._detail_top_n = QSpinBox()
+        self._detail_top_n.setRange(0, 10000)
+        self._detail_top_n.setValue(detail_top_n)
+        self._detail_top_n.setSpecialValueText("Все")
+        row.addWidget(self._detail_top_n)
+        row.addStretch()
         lay.addLayout(row)
 
         sep2 = QFrame(); sep2.setObjectName("sep"); lay.addWidget(sep2)
@@ -868,6 +1113,22 @@ class SettingsDialog(QDialog):
         file_row.addWidget(browse_btn)
         lay.addLayout(file_row)
 
+        proxy_row = QHBoxLayout()
+        proxy_row.addWidget(QLabel("Прокси:"))
+        self._proxy_edit = QLineEdit()
+        self._proxy_edit.setPlaceholderText("http://host:port или socks5://host:port")
+        self._proxy_edit.setText(proxy or "")
+        proxy_row.addWidget(self._proxy_edit, 1)
+        lay.addLayout(proxy_row)
+
+        ws_proxy_row = QHBoxLayout()
+        ws_proxy_row.addWidget(QLabel("WS прокси:"))
+        self._websocket_proxy_edit = QLineEdit()
+        self._websocket_proxy_edit.setPlaceholderText("auto = как прокси, direct = без прокси, или отдельный URL")
+        self._websocket_proxy_edit.setText(websocket_proxy or "auto")
+        ws_proxy_row.addWidget(self._websocket_proxy_edit, 1)
+        lay.addLayout(ws_proxy_row)
+
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
@@ -882,37 +1143,43 @@ class SettingsDialog(QDialog):
             self._sound_edit.setText(path)
 
     def get_enabled(self):      return [k for k, v in self._checks.items() if v.isChecked()]
-    def get_top_n(self):        return self._top_n.value()
+    def get_main_top_n(self):   return self._main_top_n.value()
+    def get_detail_top_n(self): return self._detail_top_n.value()
     def get_alert_spread(self): return self._alert_spread.value()
     def get_sound_path(self):   return self._sound_edit.text().strip()
+    def get_proxy(self):        return self._proxy_edit.text().strip()
+    def get_websocket_proxy(self): return self._websocket_proxy_edit.text().strip()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Главное окно
+#  Детальная вкладка мониторинга одного токена
 # ══════════════════════════════════════════════════════════════════════════════
 
-class MainWindow(QMainWindow):
-    def __init__(self):
+class DetailMonitorWidget(QWidget):
+    def __init__(
+        self,
+        get_enabled: Callable[[], List[str]],
+        get_top_n: Callable[[], int],
+        get_alert_spread: Callable[[], float],
+        get_sound_path: Callable[[], str],
+        audio: AudioAlert,
+        settings_callback: Optional[Callable[[], None]] = None,
+        initial_token: str = "",
+        parent=None,
+    ):
         super().__init__()
-        self.setWindowTitle("Arbitrage Monitor")
-        self.resize(1200, 720)
-        self.setMinimumSize(900, 500)
-
-        self._exchanges = list(DEFAULT_EXCHANGES)
-        self._enabled   = list(DEFAULT_EXCHANGES)
-        self._top_n     = 50
+        self._get_enabled = get_enabled
+        self._get_top_n = get_top_n
+        self._get_alert_spread = get_alert_spread
+        self._get_sound_path = get_sound_path
+        self._audio = audio
+        self._settings_callback = settings_callback
         self._worker: Optional[MonitorWorker] = None
         self._symbol = ""
         self._update_count = 0
         self._history = SpreadHistoryManager()
         self._spread_wins: Dict[str, SpreadHistoryWindow]  = {}
         self._fund_wins:   Dict[str, FundingHistoryWindow] = {}
-
-        cfg = load_config()
-        self._alert_spread: float = cfg.get("alert_spread", 1.0)
-        self._sound_path:   str   = cfg.get("sound_path", "")
-        self._audio = AudioAlert()
-        self._audio.set_file(self._sound_path)
         self._alerted: bool = False
 
         self._render_timer = QTimer()
@@ -920,9 +1187,7 @@ class MainWindow(QMainWindow):
         self._render_timer.timeout.connect(self._flush_render)
         self._dirty = False
 
-        central = QWidget()
-        self.setCentralWidget(central)
-        root = QVBoxLayout(central)
+        root = QVBoxLayout(self)
         root.setContentsMargins(12, 8, 12, 8)
         root.setSpacing(6)
 
@@ -940,12 +1205,13 @@ class MainWindow(QMainWindow):
         ir = QHBoxLayout(); ir.setSpacing(8)
         self._token = QLineEdit()
         self._token.setPlaceholderText("Токен: BTC / ETH / BTCUSDT …")
-        self._token.returnPressed.connect(self._start)
+        self._token.setText(initial_token)
+        self._token.returnPressed.connect(self.start_current)
         ir.addWidget(self._token, 1)
 
         self._btn_start = QPushButton("▶  СТАРТ")
         self._btn_start.setObjectName("accent")
-        self._btn_start.clicked.connect(self._start)
+        self._btn_start.clicked.connect(self.start_current)
         ir.addWidget(self._btn_start)
 
         self._btn_stop = QPushButton("■  СТОП")
@@ -955,6 +1221,7 @@ class MainWindow(QMainWindow):
 
         self._btn_cfg = QPushButton("⚙  Настройки")
         self._btn_cfg.clicked.connect(self._settings)
+        self._btn_cfg.setEnabled(self._settings_callback is not None)
         ir.addWidget(self._btn_cfg)
         root.addLayout(ir)
 
@@ -1012,7 +1279,11 @@ class MainWindow(QMainWindow):
         if t.endswith("USDT"): return t[:-4]
         return t
 
-    def _start(self):
+    def set_token_and_start(self, token: str):
+        self._token.setText(token)
+        self.start_current()
+
+    def start_current(self):
         base = self._normalize(self._token.text())
         if not base:
             self._status.setText("⚠ Введите токен")
@@ -1031,7 +1302,7 @@ class MainWindow(QMainWindow):
         self._spread_panel.clear_all()
         self._ticker_panel.clear_all()
         self._status.setText(f"▶ {base}  •  подключение…")
-        self._worker = MonitorWorker(base, self._enabled, self._top_n)
+        self._worker = MonitorWorker(base, self._get_enabled(), self._get_top_n())
         self._worker.updated.connect(self._mark_dirty)
         self._worker.err.connect(lambda m: self._status.setText(f"❌ {m[:80]}"))
         self._worker.start()
@@ -1088,12 +1359,14 @@ class MainWindow(QMainWindow):
             f"▶ {self._symbol}  •  {online}/{total} онлайн  •  {visible} пар"
         )
 
-        if self._alert_spread > 0 and self._sound_path:
+        alert_spread = self._get_alert_spread()
+        sound_path = self._get_sound_path()
+        if alert_spread > 0 and sound_path:
             best = max((p.spread_pct for p in pairs), default=0.0)
-            if best >= self._alert_spread and not self._alerted:
+            if best >= alert_spread and not self._alerted:
                 self._alerted = True
                 self._audio.play()
-            elif best < self._alert_spread:
+            elif best < alert_spread:
                 self._alerted = False
 
     def _on_row_moved(self, new_order: List[str]):
@@ -1101,22 +1374,17 @@ class MainWindow(QMainWindow):
             self._worker.monitor.reorder_pairs(new_order)
 
     def _settings(self):
-        dlg = SettingsDialog(
-            self._exchanges, self._enabled, self._top_n,
-            self._alert_spread, self._sound_path, self
-        )
-        dlg.setStyleSheet(SS)
-        if dlg.exec_():
-            self._enabled      = dlg.get_enabled()
-            self._top_n        = dlg.get_top_n()
-            self._alert_spread = dlg.get_alert_spread()
-            self._sound_path   = dlg.get_sound_path()
-            self._audio.set_file(self._sound_path)
-            self._alerted = False
-            save_config({
-                "alert_spread": self._alert_spread,
-                "sound_path":   self._sound_path,
-            })
+        if self._settings_callback:
+            self._settings_callback()
+
+    def close_monitor(self):
+        self._stop()
+        for win in list(self._spread_wins.values()):
+            win.close()
+        for win in list(self._fund_wins.values()):
+            win.close()
+        self._spread_wins.clear()
+        self._fund_wins.clear()
 
     # ── История спреда и фандинга ──────────────────────────────────────────────
 
@@ -1172,8 +1440,130 @@ class MainWindow(QMainWindow):
         self._fund_wins[pair_key] = win
         win.show()
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Главное окно
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Arbitrage Monitor")
+        self.resize(1200, 720)
+        self.setMinimumSize(900, 500)
+
+        self._exchanges = list(DEFAULT_EXCHANGES)
+        self._enabled   = list(DEFAULT_EXCHANGES)
+
+        cfg = ensure_config()
+        self._main_top_n: int = int(cfg.get("main_top_n", 100))
+        self._detail_top_n: int = int(cfg.get("detail_top_n", 50))
+        self._alert_spread: float = cfg.get("alert_spread", 1.0)
+        self._sound_path:   str   = cfg.get("sound_path", "")
+        self._proxy:        str   = cfg.get("proxy", "")
+        self._websocket_proxy: str = cfg.get("websocket_proxy", "auto")
+        self._audio = AudioAlert()
+        self._audio.set_file(self._sound_path)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(12, 8, 12, 8)
+        root.setSpacing(6)
+
+        self._tabs = QTabWidget()
+        self._tabs.setTabsClosable(True)
+        self._tabs.tabCloseRequested.connect(self._close_tab)
+        root.addWidget(self._tabs)
+
+        self._scanner_panel = ScannerPanel(
+            lambda: list(self._enabled),
+            lambda: self._main_top_n,
+            self,
+        )
+        self._scanner_panel.token_opened.connect(self._open_token_from_scanner)
+        self._tabs.addTab(self._scanner_panel, "СКАНЕР")
+
+        self._manual_detail = self._make_detail_tab()
+        self._tabs.addTab(self._manual_detail, "ДЕТАЛЬНО")
+        self._lock_fixed_tab_buttons()
+
+        self._token_tabs: Dict[str, DetailMonitorWidget] = {}
+
+    def _make_detail_tab(self, token: str = "") -> DetailMonitorWidget:
+        return DetailMonitorWidget(
+            get_enabled=lambda: list(self._enabled),
+            get_top_n=lambda: self._detail_top_n,
+            get_alert_spread=lambda: self._alert_spread,
+            get_sound_path=lambda: self._sound_path,
+            audio=self._audio,
+            settings_callback=self._settings,
+            initial_token=token,
+            parent=self,
+        )
+
+    def _lock_fixed_tab_buttons(self):
+        bar = self._tabs.tabBar()
+        for index in (0, 1):
+            bar.setTabButton(index, QTabBar.RightSide, None)
+            bar.setTabButton(index, QTabBar.LeftSide, None)
+
+    def _open_token_from_scanner(self, token: str):
+        token = self._manual_detail._normalize(token)
+        if not token:
+            return
+        if token in self._token_tabs:
+            self._tabs.setCurrentWidget(self._token_tabs[token])
+            return
+
+        tab = self._make_detail_tab(token)
+        self._token_tabs[token] = tab
+        index = self._tabs.addTab(tab, token)
+        self._tabs.setCurrentIndex(index)
+        QTimer.singleShot(0, tab.start_current)
+
+    def _close_tab(self, index: int):
+        if index <= 1:
+            return
+        widget = self._tabs.widget(index)
+        if isinstance(widget, DetailMonitorWidget):
+            token = self._tabs.tabText(index)
+            widget.close_monitor()
+            self._token_tabs.pop(token, None)
+        self._tabs.removeTab(index)
+        if widget:
+            widget.deleteLater()
+
+    def _settings(self):
+        dlg = SettingsDialog(
+            self._exchanges, self._enabled, self._main_top_n, self._detail_top_n,
+            self._alert_spread, self._sound_path, self._proxy, self._websocket_proxy, self
+        )
+        dlg.setStyleSheet(SS)
+        if dlg.exec_():
+            self._enabled      = dlg.get_enabled()
+            self._main_top_n   = dlg.get_main_top_n()
+            self._detail_top_n = dlg.get_detail_top_n()
+            self._alert_spread = dlg.get_alert_spread()
+            self._sound_path   = dlg.get_sound_path()
+            self._proxy        = dlg.get_proxy()
+            self._websocket_proxy = dlg.get_websocket_proxy()
+            self._audio.set_file(self._sound_path)
+            save_config({
+                "main_top_n": self._main_top_n,
+                "detail_top_n": self._detail_top_n,
+                "alert_spread": self._alert_spread,
+                "sound_path":   self._sound_path,
+                "proxy":        self._proxy,
+                "websocket_proxy": self._websocket_proxy,
+            })
+
     def closeEvent(self, e):
-        self._stop()
+        self._scanner_panel.stop()
+        self._manual_detail.close_monitor()
+        for tab in list(self._token_tabs.values()):
+            tab.close_monitor()
+        self._token_tabs.clear()
         super().closeEvent(e)
 
 

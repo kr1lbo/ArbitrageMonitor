@@ -15,6 +15,9 @@ from datetime import datetime
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Callable
 
+from core.config import async_retry, ccxt_config, format_network_error, human_error, sync_retry
+from core.history import exchange_history_options
+
 logger = logging.getLogger(__name__)
 
 FUND_SHOW_THRESHOLD = 0.20   # показывать пару если fund_result >= этого значения
@@ -172,9 +175,11 @@ class ExchangeMonitor:
 
         exchange = None
         retry_delay = 2
+        stage = "init"
 
         while self._running:
             try:
+                stage = "create_exchange"
                 cls = getattr(ccxtpro, exchange_id)
                 if market_type == "spot":
                     default_type = "spot"
@@ -182,10 +187,12 @@ class ExchangeMonitor:
                     default_type = "swap" if exchange_id == "lighter" else "future"
                 else:
                     default_type = "swap"
-                opts = {"defaultType": default_type}
-                exchange = cls({"enableRateLimit": True, "options": opts})
+                opts = exchange_history_options(exchange_id, market_type)
+                opts["defaultType"] = default_type
+                exchange = cls(ccxt_config(opts, proxy_kind="websocket"))
 
-                await exchange.load_markets()
+                stage = "load_markets"
+                await async_retry(lambda: exchange.load_markets(), f"{source} load_markets")
 
                 if symbol not in exchange.markets:
                     async with self._lock:
@@ -201,6 +208,7 @@ class ExchangeMonitor:
                 self._emit()
 
                 while self._running:
+                    stage = "watch_ticker"
                     ticker = await exchange.watch_ticker(symbol)
                     price = ticker.get("last") or ticker.get("close")
                     if price:
@@ -217,11 +225,11 @@ class ExchangeMonitor:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"{source}: {e}")
+                logger.error(format_network_error(source, stage, e, proxy_kind="websocket"))
                 async with self._lock:
                     if source in self.tickers:
                         self.tickers[source].status = "Ошибка"
-                        self.tickers[source].error = str(e)[:80]
+                        self.tickers[source].error = human_error(e)[:120]
                 self._emit()
                 await asyncio.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, 30)
@@ -257,18 +265,25 @@ class ExchangeMonitor:
 
     @staticmethod
     def _fetch_funding_sync(exchange_id: str, symbol: str) -> Optional[float]:
+        ex = None
         try:
             cls = getattr(ccxt_sync, exchange_id)
             default_type = "swap" if exchange_id in ["lighter", "hyperliquid"] else \
                 "future" if exchange_id == "kucoinfutures" else "swap"
 
-            ex = cls({"enableRateLimit": True, "options": {"defaultType": default_type}})
-            fr = ex.fetch_funding_rate(symbol)
+            ex = cls(ccxt_config({"defaultType": default_type}))
+            fr = sync_retry(lambda: ex.fetch_funding_rate(symbol), f"{exchange_id} {symbol} fetch_funding_rate")
             rate = fr.get("fundingRate")
             return rate * 100 if rate is not None else None
         except Exception as e:
             logger.debug(f"funding_sync {exchange_id}: {e}")
             return None
+        finally:
+            if ex is not None:
+                try:
+                    ex.close()
+                except Exception:
+                    pass
 
     def _emit(self):
         """Вызывает on_update не чаще MAX_UPDATE_HZ раз/сек"""
@@ -327,7 +342,10 @@ class ExchangeMonitor:
                     self._update_pair(b, a)
 
     def get_pairs_ordered(self) -> List[SpreadEntry]:
-        return [self.pair_map[k] for k in self.pair_order if k in self.pair_map]
+        pairs = [self.pair_map[k] for k in self.pair_order if k in self.pair_map]
+        if self.top_n <= 0:
+            return pairs
+        return pairs[:self.top_n]
 
     def get_tickers(self) -> Dict[str, TickerData]:
         return dict(self.tickers)

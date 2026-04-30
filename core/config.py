@@ -1,0 +1,219 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import time
+from copy import deepcopy
+from typing import Any, Callable
+
+
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "alert_spread": 1.0,
+    "sound_path": "",
+    "main_top_n": 100,
+    "detail_top_n": 50,
+    "proxy": "",
+    "websocket_proxy": "auto",
+    "request_retries": 3,
+    "retry_delay_sec": 1.0,
+}
+
+
+def _merged_config(data: dict[str, Any]) -> dict[str, Any]:
+    merged = deepcopy(DEFAULT_CONFIG)
+    if "top_n" in data and "detail_top_n" not in data:
+        data["detail_top_n"] = data["top_n"]
+    merged.update(data)
+    return merged
+
+
+def ensure_config() -> dict[str, Any]:
+    if not os.path.exists(CONFIG_PATH):
+        save_config(DEFAULT_CONFIG)
+        return deepcopy(DEFAULT_CONFIG)
+    cfg = load_config()
+    save_config(cfg)
+    return cfg
+
+
+def load_config() -> dict[str, Any]:
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    return _merged_config(data)
+
+
+def save_config(data: dict[str, Any]) -> None:
+    try:
+        existing = {}
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    existing = loaded
+        existing.update(data)
+        cfg = _merged_config(existing)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"Config save error: {exc}")
+
+
+def get_int_config(key: str, default: int) -> int:
+    value = load_config().get(key, default)
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def get_float_config(key: str, default: float) -> float:
+    value = load_config().get(key, default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def get_proxy_url(kind: str = "rest") -> str:
+    cfg = load_config()
+    if kind == "websocket":
+        ws_value = str(cfg.get("websocket_proxy", "auto")).strip()
+        if ws_value.lower() in {"", "none", "off", "direct", "no"}:
+            return ""
+        if ws_value.lower() != "auto":
+            return ws_value
+    value = cfg.get("proxy", "")
+    return str(value).strip() if value else ""
+
+
+def masked_proxy_url(proxy: str | None = None, kind: str = "rest") -> str:
+    proxy = get_proxy_url(kind) if proxy is None else proxy
+    if not proxy:
+        return "нет"
+    return re.sub(r"://([^:@/\s]+):([^@/\s]+)@", "://***:***@", proxy)
+
+
+def mask_sensitive_text(text: str) -> str:
+    for kind in ("rest", "websocket"):
+        proxy = get_proxy_url(kind)
+        if proxy:
+            text = text.replace(proxy, masked_proxy_url(proxy))
+    return re.sub(r"://([^:@/\s]+):([^@/\s]+)@", "://***:***@", text)
+
+
+def proxy_mode_label(kind: str = "rest") -> str:
+    proxy = get_proxy_url(kind)
+    if not proxy:
+        return f"{kind}=direct"
+    scheme = proxy.split("://", 1)[0] if "://" in proxy else "unknown"
+    return f"{kind}={scheme} ({masked_proxy_url(proxy)})"
+
+
+def apply_proxy_options(config: dict[str, Any], kind: str = "rest") -> dict[str, Any]:
+    proxy = get_proxy_url(kind)
+    if not proxy:
+        return config
+
+    cfg = dict(config)
+    lower = proxy.lower()
+    if lower.startswith(("socks://", "socks4://", "socks5://")):
+        if kind == "websocket":
+            cfg["wsSocksProxy"] = proxy
+        else:
+            cfg["socksProxy"] = proxy
+    elif lower.startswith("https://"):
+        if kind == "websocket":
+            cfg["wssProxy"] = proxy
+        else:
+            cfg["httpsProxy"] = proxy
+    else:
+        if kind == "websocket":
+            cfg["wsProxy"] = proxy
+        else:
+            cfg["httpProxy"] = proxy
+    return cfg
+
+
+def ccxt_config(
+    options: dict[str, Any] | None = None,
+    timeout: int | None = None,
+    proxy_kind: str = "rest",
+) -> dict[str, Any]:
+    cfg: dict[str, Any] = {"enableRateLimit": True}
+    if timeout is not None:
+        cfg["timeout"] = timeout
+    if options is not None:
+        cfg["options"] = options
+    return apply_proxy_options(cfg, proxy_kind)
+
+
+def human_error(exc: Exception) -> str:
+    name = type(exc).__name__
+    text = mask_sensitive_text(str(exc))
+    lower = text.lower()
+
+    if name == "IncompleteReadError" or "0 bytes read on a total of 2 expected bytes" in lower:
+        return (
+            "соединение оборвалось во время TLS/прокси handshake "
+            "(часто неверная схема proxy, плохой порт или прокси не поддерживает CONNECT/WSS)"
+        )
+    if "400" in lower and "bad request" in lower and "url='http" in lower:
+        return "HTTP-прокси вернул 400 на WebSocket/CONNECT; REST может работать, но WSS через этот прокси не поддерживается"
+    if "decryption_failed_or_bad_record_mac" in lower or "bad record mac" in lower:
+        return "TLS-соединение повреждено/разорвано прокси; часто признак нестабильного или неподходящего прокси"
+    if "����" in text:
+        return "соединение было принудительно закрыто удалённой стороной или прокси"
+    if "unexpected socks version" in lower:
+        return "порт не похож на SOCKS-прокси; попробуйте схему http:// для этого host:port"
+    if "to use socks proxy" in lower and "aiohttp_socks" in lower:
+        return "для SOCKS-прокси не установлена зависимость aiohttp-socks"
+    if name in {"TimeoutError", "RequestTimeout"} or "timed out" in lower or "timeout" in lower:
+        return "таймаут сетевого запроса"
+    if name in {"ProxyError", "InvalidProxySettings"}:
+        return f"ошибка настроек/работы прокси: {text}"
+    if text:
+        return f"{name}: {text}"
+    return name
+
+
+def format_network_error(source: str, stage: str, exc: Exception, proxy_kind: str = "rest") -> str:
+    return f"{source} [{stage}] {proxy_mode_label(proxy_kind)}: {human_error(exc)}"
+
+
+async def async_retry(coro_factory: Callable[[], Any], what: str):
+    retries = max(1, get_int_config("request_retries", DEFAULT_CONFIG["request_retries"]))
+    delay = max(0.0, get_float_config("retry_delay_sec", DEFAULT_CONFIG["retry_delay_sec"]))
+    last_exc: Exception | None = None
+    for attempt in range(retries):
+        try:
+            return await coro_factory()
+        except Exception as exc:
+            last_exc = exc
+            if attempt + 1 < retries:
+                await asyncio.sleep(delay * (attempt + 1))
+    assert last_exc is not None
+    raise RuntimeError(f"{what}: {last_exc}") from last_exc
+
+
+def sync_retry(call_factory: Callable[[], Any], what: str):
+    retries = max(1, get_int_config("request_retries", DEFAULT_CONFIG["request_retries"]))
+    delay = max(0.0, get_float_config("retry_delay_sec", DEFAULT_CONFIG["retry_delay_sec"]))
+    last_exc: Exception | None = None
+    for attempt in range(retries):
+        try:
+            return call_factory()
+        except Exception as exc:
+            last_exc = exc
+            if attempt + 1 < retries:
+                time.sleep(delay * (attempt + 1))
+    assert last_exc is not None
+    raise RuntimeError(f"{what}: {last_exc}") from last_exc
