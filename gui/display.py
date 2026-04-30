@@ -8,6 +8,7 @@ import asyncio
 import datetime
 import json
 import os
+import time
 from typing import List, Optional, Dict
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
@@ -25,6 +26,8 @@ from core.exchange import (
     EXCHANGE_CONFIGS, EXCHANGE_LABELS,
     source_label, FUND_SHOW_THRESHOLD,
 )
+from core.history import SpreadHistoryManager
+from gui.history_window import SpreadHistoryWindow, FundingHistoryWindow
 from main import EXCHANGES as DEFAULT_EXCHANGES
 
 os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
@@ -155,7 +158,6 @@ QHeaderView::section {{
 QHeaderView::section:hover {{
     background-color: {C['bg3']};
     color: {C['text']};
-    cursor: pointer;
 }}
 QLineEdit {{
     background-color: {C['bg3']};
@@ -264,6 +266,8 @@ C_SPREAD = 2
 C_F_BUY  = 3
 C_F_SELL = 4
 C_FUND_R = 5
+C_HS     = 6
+C_HF     = 7
 
 SPREAD_HEADERS = [
     "КУПИТЬ  (LONG)",
@@ -272,6 +276,8 @@ SPREAD_HEADERS = [
     "FUND LONG",
     "FUND SHORT",
     "FUND RESULT",
+    "HS",
+    "HF",
 ]
 
 # Числовые колонки (для правильной сортировки)
@@ -303,10 +309,12 @@ def _parse_pct(text: str) -> float:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SpreadTableWidget(QTableWidget):
-    row_moved = pyqtSignal(list)
+    row_moved  = pyqtSignal(list)
+    hs_clicked = pyqtSignal(str)   # pair_key
+    hf_clicked = pyqtSignal(str)   # pair_key
 
     def __init__(self):
-        super().__init__(0, 6)
+        super().__init__(0, 8)
         self.setHorizontalHeaderLabels(SPREAD_HEADERS)
         self.verticalHeader().setVisible(False)
         self.setAlternatingRowColors(True)
@@ -327,6 +335,10 @@ class SpreadTableWidget(QTableWidget):
         hdr.setSectionResizeMode(C_F_BUY,  QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(C_F_SELL, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(C_FUND_R, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(C_HS,     QHeaderView.Fixed)
+        hdr.setSectionResizeMode(C_HF,     QHeaderView.Fixed)
+        self.setColumnWidth(C_HS, 38)
+        self.setColumnWidth(C_HF, 38)
         self.verticalHeader().setDefaultSectionSize(26)
 
         self._sort_col: int = -1
@@ -335,6 +347,22 @@ class SpreadTableWidget(QTableWidget):
         hdr.sectionClicked.connect(self._on_header_click)
         hdr.setSortIndicatorShown(True)
         hdr.setSortIndicator(-1, Qt.AscendingOrder)
+
+        self.cellClicked.connect(self._on_cell_click)
+
+    def _on_cell_click(self, row: int, col: int):
+        if col not in (C_HS, C_HF):
+            return
+        buy_it = self.item(row, C_BUY)
+        if not buy_it:
+            return
+        key = buy_it.data(Qt.UserRole)
+        if not key:
+            return
+        if col == C_HS:
+            self.hs_clicked.emit(key)
+        else:
+            self.hf_clicked.emit(key)
 
     # ── Drag & drop ───────────────────────────────────────────────────────────
 
@@ -583,6 +611,16 @@ class SpreadPanel(QWidget):
                 table.setItem(row, C_F_BUY,  _mk(""))
                 table.setItem(row, C_F_SELL, _mk(""))
                 table.setItem(row, C_FUND_R, _mk(""))
+
+                hs = _mk("HS")
+                hs.setForeground(QColor(C["accent"]))
+                hs.setToolTip("История спреда")
+                table.setItem(row, C_HS, hs)
+
+                hf = _mk("HF")
+                hf.setForeground(QColor(C["accent"]))
+                hf.setToolTip("История фандинга")
+                table.setItem(row, C_HF, hf)
 
             row = self._find_row(key)
             if row < 0:
@@ -866,6 +904,9 @@ class MainWindow(QMainWindow):
         self._worker: Optional[MonitorWorker] = None
         self._symbol = ""
         self._update_count = 0
+        self._history = SpreadHistoryManager()
+        self._spread_wins: Dict[str, SpreadHistoryWindow]  = {}
+        self._fund_wins:   Dict[str, FundingHistoryWindow] = {}
 
         cfg = load_config()
         self._alert_spread: float = cfg.get("alert_spread", 1.0)
@@ -937,6 +978,8 @@ class MainWindow(QMainWindow):
 
         self._spread_panel = SpreadPanel()
         self._spread_panel.table.row_moved.connect(self._on_row_moved)
+        self._spread_panel.table.hs_clicked.connect(self._open_spread_history)
+        self._spread_panel.table.hf_clicked.connect(self._open_funding_history)
         ll.addWidget(self._spread_panel)
         splitter.addWidget(left)
 
@@ -977,6 +1020,14 @@ class MainWindow(QMainWindow):
         self._stop()
         self._symbol = base
         self._update_count = 0
+        self._history = SpreadHistoryManager()
+        # Закрываем все открытые окна истории
+        for win in list(self._spread_wins.values()):
+            win.close()
+        for win in list(self._fund_wins.values()):
+            win.close()
+        self._spread_wins.clear()
+        self._fund_wins.clear()
         self._spread_panel.clear_all()
         self._ticker_panel.clear_all()
         self._status.setText(f"▶ {base}  •  подключение…")
@@ -1018,6 +1069,15 @@ class MainWindow(QMainWindow):
         self._spread_panel.update_pairs(pairs)
         self._ticker_panel.update_tickers(tickers)
 
+        # Накапливаем live-данные для истории
+        ts_ms = int(time.time() * 1000)
+        for entry in pairs:
+            if entry.buy_price > 0 and entry.sell_price > 0:
+                out_spread = (entry.buy_price - entry.sell_price) / entry.sell_price * 100
+                self._history.add_live_spread(
+                    entry.pair_key, ts_ms, entry.spread_pct, out_spread
+                )
+
         online  = sum(1 for td in tickers.values() if td.status == "Онлайн")
         total   = len(tickers)
         visible = sum(
@@ -1057,6 +1117,60 @@ class MainWindow(QMainWindow):
                 "alert_spread": self._alert_spread,
                 "sound_path":   self._sound_path,
             })
+
+    # ── История спреда и фандинга ──────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_source(source: str):
+        """'binance_spot' → ('binance', 'spot'), 'kucoinfutures_perp' → ('kucoinfutures', 'perp')"""
+        parts = source.split('_')
+        return '_'.join(parts[:-1]), parts[-1]
+
+    def _open_spread_history(self, pair_key: str):
+        if not self._symbol:
+            return
+        if pair_key in self._spread_wins:
+            win = self._spread_wins[pair_key]
+            win.raise_()
+            win.activateWindow()
+            return
+        buy_src, sell_src = pair_key.split('>>')
+        buy_exc_id,  buy_mkt  = self._parse_source(buy_src)
+        sell_exc_id, sell_mkt = self._parse_source(sell_src)
+        win = SpreadHistoryWindow(
+            pair_key=pair_key,
+            buy_label=source_label(buy_exc_id,  buy_mkt),
+            sell_label=source_label(sell_exc_id, sell_mkt),
+            buy_exc_id=buy_exc_id,   buy_mkt=buy_mkt,
+            sell_exc_id=sell_exc_id, sell_mkt=sell_mkt,
+            symbol=self._symbol,
+            history=self._history,
+        )
+        win.destroyed.connect(lambda: self._spread_wins.pop(pair_key, None))
+        self._spread_wins[pair_key] = win
+        win.show()
+
+    def _open_funding_history(self, pair_key: str):
+        if not self._symbol:
+            return
+        if pair_key in self._fund_wins:
+            win = self._fund_wins[pair_key]
+            win.raise_()
+            win.activateWindow()
+            return
+        buy_src, sell_src = pair_key.split('>>')
+        buy_exc_id,  buy_mkt  = self._parse_source(buy_src)
+        sell_exc_id, sell_mkt = self._parse_source(sell_src)
+        win = FundingHistoryWindow(
+            buy_label=source_label(buy_exc_id,  buy_mkt),
+            sell_label=source_label(sell_exc_id, sell_mkt),
+            buy_exc_id=buy_exc_id,   buy_mkt=buy_mkt,
+            sell_exc_id=sell_exc_id, sell_mkt=sell_mkt,
+            symbol=self._symbol,
+        )
+        win.destroyed.connect(lambda: self._fund_wins.pop(pair_key, None))
+        self._fund_wins[pair_key] = win
+        win.show()
 
     def closeEvent(self, e):
         self._stop()

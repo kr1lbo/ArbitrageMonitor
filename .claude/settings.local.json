@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install *)",
+      "Bash(python -c \"import pyqtgraph; print\\('pyqtgraph', pyqtgraph.__version__\\)\")",
+      "Bash(python -c ' *)"
+    ]
+  }
+}
