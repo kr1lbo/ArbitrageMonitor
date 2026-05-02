@@ -35,6 +35,10 @@ class SpreadPanelGuiTests(unittest.TestCase):
         self.assertFalse(hidden_by_key["binance_spot>>bybit_perp"])
         self.assertFalse(hidden_by_key["aster_perp>>bybit_perp"])
         self.assertTrue(hidden_by_key["gate_spot>>bybit_perp"])
+        self.assertEqual(
+            panel.visible_pair_keys(),
+            {"binance_spot>>bybit_perp", "aster_perp>>bybit_perp"},
+        )
 
     def test_cached_history_window_is_shown_again_after_close(self):
         win = QWidget()

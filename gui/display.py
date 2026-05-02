@@ -967,6 +967,18 @@ class SpreadPanel(QWidget):
                     order.append(key)
         return order
 
+    def visible_pair_keys(self) -> set[str]:
+        keys = set()
+        for r in range(self.table.rowCount()):
+            if self.table.isRowHidden(r):
+                continue
+            it = self.table.item(r, C_BUY)
+            if it:
+                key = it.data(Qt.UserRole)
+                if key:
+                    keys.add(key)
+        return keys
+
     def clear_all(self):
         self.table.setRowCount(0)
         self._row_index.clear()
@@ -1382,7 +1394,11 @@ class DetailMonitorWidget(QWidget):
         alert_spread = self._get_alert_spread()
         sound_path = self._get_sound_path()
         if alert_spread > 0 and sound_path:
-            best = max((p.spread_pct for p in pairs), default=0.0)
+            visible_keys = self._spread_panel.visible_pair_keys()
+            best = max(
+                (p.spread_pct for p in pairs if p.pair_key in visible_keys),
+                default=0.0,
+            )
             if best >= alert_spread and not self._alerted:
                 self._alerted = True
                 self._audio.play()
