@@ -8,7 +8,7 @@ import asyncio
 import datetime
 import os
 import time
-from typing import Callable, List, Optional, Dict
+from typing import Any, Callable, List, Optional, Dict
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont, QColor
@@ -25,7 +25,7 @@ from core.exchange import (
     EXCHANGE_CONFIGS, EXCHANGE_LABELS,
     source_label, FUND_SHOW_THRESHOLD,
 )
-from core.config import ensure_config, save_config
+from core.config import ensure_config, load_config, save_config
 from core.history import SpreadHistoryManager
 from core.scanner import ScannerEntry, scan_market
 from gui.history_window import SpreadHistoryWindow, FundingHistoryWindow
@@ -329,10 +329,17 @@ class ScannerPanel(QWidget):
     C_SOURCES = 6
     C_UPDATED = 7
 
-    def __init__(self, get_exchanges, get_top_n, parent=None):
+    def __init__(
+        self,
+        get_exchanges,
+        get_top_n,
+        parent=None,
+        before_scan: Optional[Callable[[], None]] = None,
+    ):
         super().__init__(parent)
         self._get_exchanges = get_exchanges
         self._get_top_n = get_top_n
+        self._before_scan = before_scan
         self._worker: ScannerWorker | None = None
         self._running = False
         self._last_entries: list[ScannerEntry] = []
@@ -422,6 +429,8 @@ class ScannerPanel(QWidget):
     def _scan_once(self):
         if self._worker and self._worker.isRunning():
             return
+        if self._before_scan:
+            self._before_scan()
         exchanges = list(self._get_exchanges())
         if not exchanges:
             self._status.setText("Нет включённых бирж")
@@ -1196,6 +1205,7 @@ class DetailMonitorWidget(QWidget):
         get_sound_path: Callable[[], str],
         audio: AudioAlert,
         settings_callback: Optional[Callable[[], None]] = None,
+        before_start: Optional[Callable[[], None]] = None,
         initial_token: str = "",
         parent=None,
     ):
@@ -1206,6 +1216,7 @@ class DetailMonitorWidget(QWidget):
         self._get_sound_path = get_sound_path
         self._audio = audio
         self._settings_callback = settings_callback
+        self._before_start = before_start
         self._worker: Optional[MonitorWorker] = None
         self._symbol = ""
         self._update_count = 0
@@ -1316,6 +1327,8 @@ class DetailMonitorWidget(QWidget):
         self.start_current()
 
     def start_current(self):
+        if self._before_start:
+            self._before_start()
         base = self._normalize(self._token.text())
         if not base:
             self._status.setText("⚠ Введите токен")
@@ -1498,15 +1511,14 @@ class MainWindow(QMainWindow):
         self._exchanges = list(DEFAULT_EXCHANGES)
         self._enabled   = list(DEFAULT_EXCHANGES)
 
-        cfg = ensure_config()
-        self._main_top_n: int = int(cfg.get("main_top_n", 100))
-        self._detail_top_n: int = int(cfg.get("detail_top_n", 50))
-        self._alert_spread: float = cfg.get("alert_spread", 1.0)
-        self._sound_path:   str   = cfg.get("sound_path", "")
-        self._proxy:        str   = cfg.get("proxy", "")
-        self._websocket_proxy: str = cfg.get("websocket_proxy", "auto")
+        self._main_top_n: int = 100
+        self._detail_top_n: int = 50
+        self._alert_spread: float = 1.0
+        self._sound_path: str = ""
+        self._proxy: str = ""
+        self._websocket_proxy: str = "auto"
         self._audio = AudioAlert()
-        self._audio.set_file(self._sound_path)
+        self._apply_config(ensure_config())
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -1523,6 +1535,7 @@ class MainWindow(QMainWindow):
             lambda: list(self._enabled),
             lambda: self._main_top_n,
             self,
+            before_scan=self._reload_config,
         )
         self._scanner_panel.token_opened.connect(self._open_token_from_scanner)
         self._tabs.addTab(self._scanner_panel, "СКАНЕР")
@@ -1541,9 +1554,36 @@ class MainWindow(QMainWindow):
             get_sound_path=lambda: self._sound_path,
             audio=self._audio,
             settings_callback=self._settings,
+            before_start=self._reload_config,
             initial_token=token,
             parent=self,
         )
+
+    @staticmethod
+    def _cfg_int(cfg: dict[str, Any], key: str, default: int) -> int:
+        try:
+            return max(0, int(cfg.get(key, default)))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _cfg_float(cfg: dict[str, Any], key: str, default: float) -> float:
+        try:
+            return float(cfg.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _apply_config(self, cfg: dict[str, Any]):
+        self._main_top_n = self._cfg_int(cfg, "main_top_n", 100)
+        self._detail_top_n = self._cfg_int(cfg, "detail_top_n", 50)
+        self._alert_spread = self._cfg_float(cfg, "alert_spread", 1.0)
+        self._sound_path = str(cfg.get("sound_path", "") or "")
+        self._proxy = str(cfg.get("proxy", "") or "")
+        self._websocket_proxy = str(cfg.get("websocket_proxy", "auto") or "auto")
+        self._audio.set_file(self._sound_path)
+
+    def _reload_config(self):
+        self._apply_config(load_config())
 
     def _lock_fixed_tab_buttons(self):
         bar = self._tabs.tabBar()
@@ -1578,6 +1618,7 @@ class MainWindow(QMainWindow):
             widget.deleteLater()
 
     def _settings(self):
+        self._reload_config()
         dlg = SettingsDialog(
             self._exchanges, self._enabled, self._main_top_n, self._detail_top_n,
             self._alert_spread, self._sound_path, self._proxy, self._websocket_proxy, self

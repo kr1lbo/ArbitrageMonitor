@@ -26,40 +26,49 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 def _merged_config(data: dict[str, Any]) -> dict[str, Any]:
     merged = deepcopy(DEFAULT_CONFIG)
-    if "top_n" in data and "detail_top_n" not in data:
-        data["detail_top_n"] = data["top_n"]
-    merged.update(data)
+    values = dict(data)
+    if "top_n" in values and "detail_top_n" not in values:
+        values["detail_top_n"] = values["top_n"]
+    merged.update(values)
     return merged
+
+
+def _read_config_file() -> tuple[dict[str, Any], bool]:
+    if not os.path.exists(CONFIG_PATH):
+        return {}, True
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except Exception as exc:
+        print(f"Config load error: {CONFIG_PATH}: {exc}")
+        return {}, False
+    if not isinstance(data, dict):
+        print(f"Config load error: {CONFIG_PATH}: root value must be a JSON object")
+        return {}, False
+    return data, True
 
 
 def ensure_config() -> dict[str, Any]:
     if not os.path.exists(CONFIG_PATH):
         save_config(DEFAULT_CONFIG)
         return deepcopy(DEFAULT_CONFIG)
-    cfg = load_config()
-    save_config(cfg)
+    data, ok = _read_config_file()
+    cfg = _merged_config(data)
+    if ok:
+        save_config(cfg)
     return cfg
 
 
 def load_config() -> dict[str, Any]:
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            data = {}
-    except Exception:
-        data = {}
+    data, _ok = _read_config_file()
     return _merged_config(data)
 
 
 def save_config(data: dict[str, Any]) -> None:
     try:
-        existing = {}
-        if os.path.exists(CONFIG_PATH):
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-                if isinstance(loaded, dict):
-                    existing = loaded
+        existing, ok = _read_config_file()
+        if not ok:
+            existing = {}
         existing.update(data)
         cfg = _merged_config(existing)
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:

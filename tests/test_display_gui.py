@@ -8,7 +8,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication, QWidget
 
 from core.exchange import SpreadEntry
-from gui.display import DetailMonitorWidget, SpreadPanel
+from gui.display import DetailMonitorWidget, ScannerPanel, SpreadPanel
 
 
 class SpreadPanelGuiTests(unittest.TestCase):
@@ -53,6 +53,35 @@ class SpreadPanelGuiTests(unittest.TestCase):
         self.assertTrue(DetailMonitorWidget._activate_cached_window(wins, "pair"))
         self.assertTrue(win.isVisible())
         win.close()
+
+    def test_scanner_reloads_config_before_scan(self):
+        calls = []
+        panel = ScannerPanel(
+            get_exchanges=lambda: [],
+            get_top_n=lambda: 100,
+            before_scan=lambda: calls.append("reload"),
+        )
+
+        panel._scan_once()
+
+        self.assertEqual(calls, ["reload"])
+        self.assertEqual(panel._status.text(), "Нет включённых бирж")
+
+    def test_detail_reloads_config_before_start(self):
+        calls = []
+        widget = DetailMonitorWidget(
+            get_enabled=lambda: [],
+            get_top_n=lambda: 50,
+            get_alert_spread=lambda: 0.0,
+            get_sound_path=lambda: "",
+            audio=object(),
+            before_start=lambda: calls.append("reload"),
+        )
+
+        widget.start_current()
+
+        self.assertEqual(calls, ["reload"])
+        self.assertIn("Введите токен", widget._status.text())
 
 
 if __name__ == "__main__":
