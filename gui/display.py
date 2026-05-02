@@ -110,6 +110,16 @@ QPushButton#accent {{
     font-weight: bold;
 }}
 QPushButton#accent:hover {{ background-color: #3a7de0; }}
+QPushButton#new_tab_btn {{
+    background-color: {C['accent']};
+    color: #fff;
+    border: none;
+    font-weight: bold;
+    padding: 5px 12px;
+    margin-right: 6px;
+    margin-bottom: 2px;
+}}
+QPushButton#new_tab_btn:hover {{ background-color: #3a7de0; }}
 QPushButton#clear_btn {{
     background-color: transparent;
     color: {C['muted']};
@@ -118,6 +128,53 @@ QPushButton#clear_btn {{
     font-size: 14px;
 }}
 QPushButton#clear_btn:hover {{ color: {C['text']}; }}
+QTabWidget::pane {{
+    background-color: {C['bg']};
+    border: none;
+    border-top: 1px solid {C['border']};
+    top: -1px;
+}}
+QTabWidget::tab-bar {{
+    alignment: left;
+}}
+QTabBar::tab {{
+    background-color: {C['bg2']};
+    color: {C['muted']};
+    border: 1px solid {C['border']};
+    border-bottom: none;
+    border-top-left-radius: 4px;
+    border-top-right-radius: 4px;
+    padding: 7px 14px;
+    margin-right: 2px;
+    min-width: 70px;
+}}
+QTabBar::tab:selected {{
+    background-color: {C['bg']};
+    color: {C['accent']};
+    border-color: {C['border']};
+    border-bottom: 1px solid {C['bg']};
+    font-weight: bold;
+}}
+QTabBar::tab:!selected {{
+    margin-top: 3px;
+}}
+QTabBar::tab:!selected:hover {{
+    background-color: {C['bg3']};
+    color: {C['text']};
+}}
+QPushButton#tab_close_btn {{
+    background-color: {C['red']};
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: bold;
+    padding: 0;
+    margin-left: 6px;
+}}
+QPushButton#tab_close_btn:hover {{
+    background-color: #ff7a86;
+}}
 QTableWidget {{
     background-color: {C['bg2']};
     alternate-background-color: {C['row_alt']};
@@ -1549,15 +1606,16 @@ class MainWindow(QMainWindow):
         root.setSpacing(6)
 
         self._tabs = QTabWidget()
-        self._tabs.setTabsClosable(True)
-        self._tabs.tabCloseRequested.connect(self._close_tab)
+        self._tabs.setTabsClosable(False)
         root.addWidget(self._tabs)
 
         self._token_tabs: Dict[str, DetailMonitorWidget] = {}
         self._detail_tabs: List[DetailMonitorWidget] = []
 
-        self._btn_add_detail = QPushButton("+")
-        self._btn_add_detail.setFixedWidth(30)
+        self._btn_add_detail = QPushButton("+ Новая вкладка")
+        self._btn_add_detail.setObjectName("new_tab_btn")
+        self._btn_add_detail.setMinimumWidth(128)
+        self._btn_add_detail.setFixedHeight(28)
         self._btn_add_detail.setToolTip("Открыть новую детальную вкладку")
         self._btn_add_detail.clicked.connect(self._open_blank_detail_tab)
         self._tabs.setCornerWidget(self._btn_add_detail, Qt.TopRightCorner)
@@ -1599,6 +1657,7 @@ class MainWindow(QMainWindow):
         tab = self._make_detail_tab(token)
         self._detail_tabs.append(tab)
         index = self._tabs.addTab(tab, token or "ДЕТАЛЬНО")
+        self._install_detail_close_button(tab)
         if token:
             self._token_tabs[token] = tab
         if make_current:
@@ -1609,6 +1668,17 @@ class MainWindow(QMainWindow):
 
     def _open_blank_detail_tab(self, _checked: bool = False):
         return self._add_detail_tab()
+
+    def _install_detail_close_button(self, tab: DetailMonitorWidget):
+        index = self._tabs.indexOf(tab)
+        if index < 0:
+            return
+        btn = QPushButton("×")
+        btn.setObjectName("tab_close_btn")
+        btn.setFixedSize(16, 16)
+        btn.setToolTip("Закрыть вкладку")
+        btn.clicked.connect(lambda _checked=False, detail=tab: self._close_tab(self._tabs.indexOf(detail)))
+        self._tabs.tabBar().setTabButton(index, QTabBar.RightSide, btn)
 
     @staticmethod
     def _normalize_token(text: str) -> str:

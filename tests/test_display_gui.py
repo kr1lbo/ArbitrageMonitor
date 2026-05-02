@@ -6,11 +6,11 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QApplication, QWidget
+from PyQt5.QtWidgets import QApplication, QTabBar, QWidget
 
 from core.exchange import SpreadEntry
 from gui import display as display_mod
-from gui.display import DetailMonitorWidget, ScannerPanel, SettingsDialog, SpreadPanel
+from gui.display import DetailMonitorWidget, SS, ScannerPanel, SettingsDialog, SpreadPanel
 
 
 class SpreadPanelGuiTests(unittest.TestCase):
@@ -142,6 +142,31 @@ class SpreadPanelGuiTests(unittest.TestCase):
         tab = win._tabs.currentWidget()
         self.assertIn(tab, win._detail_tabs)
         self.assertEqual(win._tabs.tabText(win._tabs.indexOf(tab)), "ДЕТАЛЬНО")
+
+    def test_plus_button_is_visually_labeled(self):
+        win = self._make_main_window()
+
+        self.assertEqual(win._btn_add_detail.text(), "+ Новая вкладка")
+        self.assertEqual(win._btn_add_detail.objectName(), "new_tab_btn")
+        self.assertGreaterEqual(win._btn_add_detail.minimumWidth(), 120)
+
+    def test_tabs_have_dark_custom_styles(self):
+        self.assertIn("QTabWidget::pane", SS)
+        self.assertIn("border: none;", SS)
+        self.assertIn("QTabBar::tab:selected", SS)
+        self.assertIn("QPushButton#tab_close_btn", SS)
+        self.assertIn("background-color: #ff7a86", SS)
+
+    def test_detail_tab_has_visible_red_close_button(self):
+        win = self._make_main_window()
+        tab = win._tabs.widget(1)
+        btn = win._tabs.tabBar().tabButton(win._tabs.indexOf(tab), QTabBar.RightSide)
+
+        self.assertIsNotNone(btn)
+        self.assertEqual(btn.text(), "×")
+        self.assertEqual(btn.objectName(), "tab_close_btn")
+        self.assertEqual(btn.width(), btn.height())
+        self.assertEqual(btn.width(), 16)
 
     def test_detail_tab_renames_to_started_token(self):
         win = self._make_main_window()
