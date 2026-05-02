@@ -1216,6 +1216,8 @@ class SettingsDialog(QDialog):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DetailMonitorWidget(QWidget):
+    token_started = pyqtSignal(str)
+
     def __init__(
         self,
         get_enabled: Callable[[], List[str]],
@@ -1352,6 +1354,7 @@ class DetailMonitorWidget(QWidget):
         if not base:
             self._status.setText("⚠ Введите токен")
             return
+        self.token_started.emit(base)
         self._stop()
         self._symbol = base
         self._update_count = 0
@@ -1550,6 +1553,15 @@ class MainWindow(QMainWindow):
         self._tabs.tabCloseRequested.connect(self._close_tab)
         root.addWidget(self._tabs)
 
+        self._token_tabs: Dict[str, DetailMonitorWidget] = {}
+        self._detail_tabs: List[DetailMonitorWidget] = []
+
+        self._btn_add_detail = QPushButton("+")
+        self._btn_add_detail.setFixedWidth(30)
+        self._btn_add_detail.setToolTip("Открыть новую детальную вкладку")
+        self._btn_add_detail.clicked.connect(self._open_blank_detail_tab)
+        self._tabs.setCornerWidget(self._btn_add_detail, Qt.TopRightCorner)
+
         self._scanner_panel = ScannerPanel(
             lambda: list(self._enabled),
             lambda: self._main_top_n,
@@ -1559,14 +1571,11 @@ class MainWindow(QMainWindow):
         self._scanner_panel.token_opened.connect(self._open_token_from_scanner)
         self._tabs.addTab(self._scanner_panel, "СКАНЕР")
 
-        self._manual_detail = self._make_detail_tab()
-        self._tabs.addTab(self._manual_detail, "ДЕТАЛЬНО")
+        self._manual_detail = self._add_detail_tab(make_current=False)
         self._lock_fixed_tab_buttons()
 
-        self._token_tabs: Dict[str, DetailMonitorWidget] = {}
-
     def _make_detail_tab(self, token: str = "") -> DetailMonitorWidget:
-        return DetailMonitorWidget(
+        tab = DetailMonitorWidget(
             get_enabled=lambda: list(self._enabled),
             get_top_n=lambda: self._detail_top_n,
             get_alert_spread=lambda: self._alert_spread,
@@ -1577,6 +1586,40 @@ class MainWindow(QMainWindow):
             initial_token=token,
             parent=self,
         )
+        tab.token_started.connect(lambda started_token, detail=tab: self._on_detail_started(detail, started_token))
+        return tab
+
+    def _add_detail_tab(
+        self,
+        token: str = "",
+        make_current: bool = True,
+        start: bool = False,
+    ) -> DetailMonitorWidget:
+        token = self._normalize_token(token)
+        tab = self._make_detail_tab(token)
+        self._detail_tabs.append(tab)
+        index = self._tabs.addTab(tab, token or "ДЕТАЛЬНО")
+        if token:
+            self._token_tabs[token] = tab
+        if make_current:
+            self._tabs.setCurrentIndex(index)
+        if start:
+            QTimer.singleShot(0, tab.start_current)
+        return tab
+
+    def _open_blank_detail_tab(self, _checked: bool = False):
+        return self._add_detail_tab()
+
+    @staticmethod
+    def _normalize_token(text: str) -> str:
+        t = str(text).strip().upper()
+        if not t:
+            return ""
+        if "/" in t:
+            return t.split("/")[0].strip()
+        if t.endswith("USDT"):
+            return t[:-4]
+        return t
 
     @staticmethod
     def _cfg_int(cfg: dict[str, Any], key: str, default: int) -> int:
@@ -1606,32 +1649,44 @@ class MainWindow(QMainWindow):
 
     def _lock_fixed_tab_buttons(self):
         bar = self._tabs.tabBar()
-        for index in (0, 1):
-            bar.setTabButton(index, QTabBar.RightSide, None)
-            bar.setTabButton(index, QTabBar.LeftSide, None)
+        bar.setTabButton(0, QTabBar.RightSide, None)
+        bar.setTabButton(0, QTabBar.LeftSide, None)
+
+    def _on_detail_started(self, tab: DetailMonitorWidget, token: str):
+        token = self._normalize_token(token)
+        if not token:
+            return
+        for old_token, old_tab in list(self._token_tabs.items()):
+            if old_tab is tab:
+                self._token_tabs.pop(old_token, None)
+        self._token_tabs[token] = tab
+        index = self._tabs.indexOf(tab)
+        if index >= 0:
+            self._tabs.setTabText(index, token)
 
     def _open_token_from_scanner(self, token: str):
-        token = self._manual_detail._normalize(token)
+        token = self._normalize_token(token)
         if not token:
             return
         if token in self._token_tabs:
             self._tabs.setCurrentWidget(self._token_tabs[token])
             return
 
-        tab = self._make_detail_tab(token)
-        self._token_tabs[token] = tab
-        index = self._tabs.addTab(tab, token)
-        self._tabs.setCurrentIndex(index)
-        QTimer.singleShot(0, tab.start_current)
+        self._add_detail_tab(token, make_current=True, start=True)
 
     def _close_tab(self, index: int):
-        if index <= 1:
+        if index <= 0:
             return
         widget = self._tabs.widget(index)
         if isinstance(widget, DetailMonitorWidget):
-            token = self._tabs.tabText(index)
             widget.close_monitor()
-            self._token_tabs.pop(token, None)
+            if widget in self._detail_tabs:
+                self._detail_tabs.remove(widget)
+            for token, tab in list(self._token_tabs.items()):
+                if tab is widget:
+                    self._token_tabs.pop(token, None)
+            if widget is self._manual_detail:
+                self._manual_detail = None
         self._tabs.removeTab(index)
         if widget:
             widget.deleteLater()
@@ -1664,9 +1719,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e):
         self._scanner_panel.stop()
-        self._manual_detail.close_monitor()
-        for tab in list(self._token_tabs.values()):
+        for tab in list(self._detail_tabs):
             tab.close_monitor()
+        self._detail_tabs.clear()
         self._token_tabs.clear()
         super().closeEvent(e)
 

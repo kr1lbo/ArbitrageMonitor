@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -8,6 +9,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication, QWidget
 
 from core.exchange import SpreadEntry
+from gui import display as display_mod
 from gui.display import DetailMonitorWidget, ScannerPanel, SettingsDialog, SpreadPanel
 
 
@@ -100,6 +102,68 @@ class SpreadPanelGuiTests(unittest.TestCase):
         self.assertEqual(dialog._config_path.text(), "C:/app/config.json")
         self.assertFalse(dialog._config_error.isHidden())
         self.assertIn("bad json", dialog._config_error.text())
+
+    def _make_main_window(self):
+        cfg = {
+            "main_top_n": 100,
+            "detail_top_n": 50,
+            "alert_spread": 0.0,
+            "sound_path": "",
+            "proxy": "",
+            "websocket_proxy": "direct",
+        }
+
+        class DummyAudio:
+            def set_file(self, _path):
+                pass
+
+            def play(self):
+                pass
+
+        patches = [
+            patch.object(display_mod, "AudioAlert", DummyAudio),
+            patch.object(display_mod, "ensure_config", return_value=dict(cfg)),
+            patch.object(display_mod, "load_config", return_value=dict(cfg)),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        win = display_mod.MainWindow()
+        self.addCleanup(win.close)
+        return win
+
+    def test_plus_button_adds_blank_detail_tab(self):
+        win = self._make_main_window()
+        initial_count = win._tabs.count()
+
+        win._open_blank_detail_tab()
+
+        self.assertEqual(win._tabs.count(), initial_count + 1)
+        tab = win._tabs.currentWidget()
+        self.assertIn(tab, win._detail_tabs)
+        self.assertEqual(win._tabs.tabText(win._tabs.indexOf(tab)), "ДЕТАЛЬНО")
+
+    def test_detail_tab_renames_to_started_token(self):
+        win = self._make_main_window()
+        tab = win._open_blank_detail_tab()
+
+        win._on_detail_started(tab, "ethusdt")
+
+        self.assertEqual(win._tabs.tabText(win._tabs.indexOf(tab)), "ETH")
+        self.assertIs(win._token_tabs["ETH"], tab)
+
+    def test_detail_tabs_are_closable_but_scanner_is_fixed(self):
+        win = self._make_main_window()
+        initial_count = win._tabs.count()
+
+        win._close_tab(0)
+        self.assertEqual(win._tabs.count(), initial_count)
+
+        detail = win._tabs.widget(1)
+        win._close_tab(1)
+
+        self.assertEqual(win._tabs.count(), initial_count - 1)
+        self.assertNotIn(detail, win._detail_tabs)
 
 
 if __name__ == "__main__":
