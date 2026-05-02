@@ -1,8 +1,16 @@
 import sys
 import logging
+import os
+
+
+def _runtime_dir() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
 
 logging.basicConfig(
-    filename="errors.log",
+    filename=os.path.join(_runtime_dir(), "errors.log"),
     level=logging.ERROR,
     format="%(asctime)s - %(levelname)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",

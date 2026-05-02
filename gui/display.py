@@ -25,7 +25,9 @@ from core.exchange import (
     EXCHANGE_CONFIGS, EXCHANGE_LABELS,
     source_label, FUND_SHOW_THRESHOLD,
 )
-from core.config import ensure_config, load_config, save_config
+from core.config import (
+    ensure_config, get_config_error, get_config_path, load_config, save_config,
+)
 from core.history import SpreadHistoryManager
 from core.scanner import ScannerEntry, scan_market
 from gui.history_window import SpreadHistoryWindow, FundingHistoryWindow
@@ -1073,13 +1075,30 @@ class TickerPanel(QWidget):
 class SettingsDialog(QDialog):
     def __init__(
         self, exchanges, enabled, main_top_n, detail_top_n,
-        alert_spread, sound_path, proxy, websocket_proxy, parent=None,
+        alert_spread, sound_path, proxy, websocket_proxy,
+        config_path: str = "", config_error: str = "", parent=None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Настройки")
-        self.setMinimumWidth(380)
+        self.setMinimumWidth(560)
         lay = QVBoxLayout(self)
         lay.setSpacing(8)
+
+        cfg_lbl = QLabel("Конфиг"); cfg_lbl.setObjectName("sub")
+        lay.addWidget(cfg_lbl)
+
+        self._config_path = QLineEdit()
+        self._config_path.setReadOnly(True)
+        self._config_path.setText(config_path)
+        lay.addWidget(self._config_path)
+
+        self._config_error = QLabel(config_error)
+        self._config_error.setObjectName("err")
+        self._config_error.setWordWrap(True)
+        self._config_error.setVisible(bool(config_error))
+        lay.addWidget(self._config_error)
+
+        sep_cfg = QFrame(); sep_cfg.setObjectName("sep"); lay.addWidget(sep_cfg)
 
         lbl = QLabel("Биржи"); lbl.setObjectName("sub")
         lay.addWidget(lbl)
@@ -1621,7 +1640,8 @@ class MainWindow(QMainWindow):
         self._reload_config()
         dlg = SettingsDialog(
             self._exchanges, self._enabled, self._main_top_n, self._detail_top_n,
-            self._alert_spread, self._sound_path, self._proxy, self._websocket_proxy, self
+            self._alert_spread, self._sound_path, self._proxy, self._websocket_proxy,
+            get_config_path(), get_config_error(), self
         )
         dlg.setStyleSheet(SS)
         if dlg.exec_():

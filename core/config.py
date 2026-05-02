@@ -2,14 +2,27 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
+import sys
 import time
 from copy import deepcopy
 from typing import Any, Callable
 
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
+def app_base_dir() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def default_config_path() -> str:
+    return os.path.join(app_base_dir(), "config.json")
+
+
+CONFIG_PATH = default_config_path()
+_LAST_CONFIG_ERROR: str = ""
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "alert_spread": 1.0,
@@ -33,18 +46,40 @@ def _merged_config(data: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
+def get_config_path() -> str:
+    return CONFIG_PATH
+
+
+def get_config_error() -> str:
+    return _LAST_CONFIG_ERROR
+
+
+def _set_config_error(message: str) -> None:
+    global _LAST_CONFIG_ERROR
+    _LAST_CONFIG_ERROR = message
+    logging.error(message)
+    print(message)
+
+
+def _clear_config_error() -> None:
+    global _LAST_CONFIG_ERROR
+    _LAST_CONFIG_ERROR = ""
+
+
 def _read_config_file() -> tuple[dict[str, Any], bool]:
     if not os.path.exists(CONFIG_PATH):
+        _clear_config_error()
         return {}, True
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
     except Exception as exc:
-        print(f"Config load error: {CONFIG_PATH}: {exc}")
+        _set_config_error(f"Config load error: {CONFIG_PATH}: {exc}")
         return {}, False
     if not isinstance(data, dict):
-        print(f"Config load error: {CONFIG_PATH}: root value must be a JSON object")
+        _set_config_error(f"Config load error: {CONFIG_PATH}: root value must be a JSON object")
         return {}, False
+    _clear_config_error()
     return data, True
 
 
@@ -96,7 +131,7 @@ def get_float_config(key: str, default: float) -> float:
 def project_path(path: str) -> str:
     if os.path.isabs(path):
         return path
-    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), path)
+    return os.path.join(app_base_dir(), path)
 
 
 def get_history_db_path() -> str:

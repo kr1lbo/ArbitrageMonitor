@@ -3,8 +3,10 @@ import contextlib
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from core import config as config_mod
 
@@ -78,11 +80,44 @@ class ConfigCoreTests(unittest.TestCase):
 
             with contextlib.redirect_stdout(io.StringIO()):
                 cfg = config_mod.ensure_config()
+            error = config_mod.get_config_error()
             with open(config_mod.CONFIG_PATH, "r", encoding="utf-8") as f:
                 text = f.read()
 
         self.assertEqual(cfg["main_top_n"], config_mod.DEFAULT_CONFIG["main_top_n"])
         self.assertEqual(text, "{ invalid json")
+        self.assertIn("Config load error", error)
+        self.assertIn("config.json", error)
+
+    def test_config_error_clears_after_successful_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_mod.CONFIG_PATH = os.path.join(tmp, "config.json")
+            with open(config_mod.CONFIG_PATH, "w", encoding="utf-8") as f:
+                f.write("{ invalid json")
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                config_mod.load_config()
+            self.assertIn("Config load error", config_mod.get_config_error())
+
+            with open(config_mod.CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump({"main_top_n": 150}, f)
+            cfg = config_mod.load_config()
+
+        self.assertEqual(cfg["main_top_n"], 150)
+        self.assertEqual(config_mod.get_config_error(), "")
+
+    def test_default_config_path_uses_exe_directory_when_frozen(self):
+        exe_path = os.path.join("C:\\", "Tools", "ArbitrageMonitor", "ArbitrageMonitor.exe")
+
+        with patch.object(sys, "frozen", True, create=True), patch.object(sys, "executable", exe_path):
+            path = config_mod.default_config_path()
+            storage_path = config_mod.project_path("spread_history.sqlite3")
+
+        self.assertEqual(path, os.path.join("C:\\", "Tools", "ArbitrageMonitor", "config.json"))
+        self.assertEqual(
+            storage_path,
+            os.path.join("C:\\", "Tools", "ArbitrageMonitor", "spread_history.sqlite3"),
+        )
 
 
 if __name__ == "__main__":

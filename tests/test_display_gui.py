@@ -8,7 +8,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication, QWidget
 
 from core.exchange import SpreadEntry
-from gui.display import DetailMonitorWidget, ScannerPanel, SpreadPanel
+from gui.display import DetailMonitorWidget, ScannerPanel, SettingsDialog, SpreadPanel
 
 
 class SpreadPanelGuiTests(unittest.TestCase):
@@ -82,6 +82,24 @@ class SpreadPanelGuiTests(unittest.TestCase):
 
         self.assertEqual(calls, ["reload"])
         self.assertIn("Введите токен", widget._status.text())
+
+    def test_settings_dialog_shows_config_path_and_error(self):
+        dialog = SettingsDialog(
+            exchanges=[],
+            enabled=[],
+            main_top_n=100,
+            detail_top_n=50,
+            alert_spread=0.0,
+            sound_path="",
+            proxy="",
+            websocket_proxy="direct",
+            config_path="C:/app/config.json",
+            config_error="Config load error: bad json",
+        )
+
+        self.assertEqual(dialog._config_path.text(), "C:/app/config.json")
+        self.assertFalse(dialog._config_error.isHidden())
+        self.assertIn("bad json", dialog._config_error.text())
 
 
 if __name__ == "__main__":
