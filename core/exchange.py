@@ -341,11 +341,24 @@ class ExchangeMonitor:
                     self._update_pair(a, b)
                     self._update_pair(b, a)
 
+    @staticmethod
+    def _pair_rank(pair: SpreadEntry) -> tuple:
+        fund_result = pair.fund_result
+        funding_priority = fund_result is not None and fund_result >= FUND_SHOW_THRESHOLD
+        if funding_priority:
+            return (1, fund_result, pair.spread_pct)
+        return (0, pair.spread_pct, fund_result or 0.0)
+
+    def _limit_pairs(self, pairs: List[SpreadEntry]) -> List[SpreadEntry]:
+        if self.top_n <= 0 or len(pairs) <= self.top_n:
+            return pairs
+
+        ranked = sorted(pairs, key=self._pair_rank, reverse=True)
+        return ranked[:self.top_n]
+
     def get_pairs_ordered(self) -> List[SpreadEntry]:
         pairs = [self.pair_map[k] for k in self.pair_order if k in self.pair_map]
-        if self.top_n <= 0:
-            return pairs
-        return pairs[:self.top_n]
+        return self._limit_pairs(pairs)
 
     def get_tickers(self) -> Dict[str, TickerData]:
         return dict(self.tickers)

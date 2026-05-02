@@ -767,7 +767,8 @@ class SpreadPanel(QWidget):
         filter_row.addWidget(self._filter_lbl("Купить:"))
         self._filter_buy = QLineEdit()
         self._filter_buy.setObjectName("filter_edit")
-        self._filter_buy.setPlaceholderText("Биржа покупки…")
+        self._filter_buy.setPlaceholderText("Биржа покупки… bybit | aster")
+        self._filter_buy.setToolTip("Можно указать несколько вариантов через |, например: bybit | aster | bingx")
         self._filter_buy.setClearButtonEnabled(True)
         self._filter_buy.textChanged.connect(self._apply_filter)
         filter_row.addWidget(self._filter_buy, 1)
@@ -777,7 +778,8 @@ class SpreadPanel(QWidget):
         filter_row.addWidget(self._filter_lbl("Продать:"))
         self._filter_sell = QLineEdit()
         self._filter_sell.setObjectName("filter_edit")
-        self._filter_sell.setPlaceholderText("Биржа продажи…")
+        self._filter_sell.setPlaceholderText("Биржа продажи… bybit | aster")
+        self._filter_sell.setToolTip("Можно указать несколько вариантов через |, например: bybit | aster | bingx")
         self._filter_sell.setClearButtonEnabled(True)
         self._filter_sell.textChanged.connect(self._apply_filter)
         filter_row.addWidget(self._filter_sell, 1)
@@ -804,9 +806,21 @@ class SpreadPanel(QWidget):
 
     # ── Фильтрация ────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _filter_terms(text: str) -> list[str]:
+        return [
+            part.strip().lower()
+            for part in text.split('|')
+            if part.strip()
+        ]
+
+    @staticmethod
+    def _matches_terms(value: str, terms: list[str]) -> bool:
+        return not terms or any(term in value for term in terms)
+
     def _apply_filter(self):
-        buy_q  = self._filter_buy.text().strip().lower()
-        sell_q = self._filter_sell.text().strip().lower()
+        buy_terms  = self._filter_terms(self._filter_buy.text())
+        sell_terms = self._filter_terms(self._filter_sell.text())
 
         for r in range(self.table.rowCount()):
             buy_it  = self.table.item(r, C_BUY)
@@ -814,8 +828,8 @@ class SpreadPanel(QWidget):
             buy_txt  = buy_it.text().lower()  if buy_it  else ""
             sell_txt = sell_it.text().lower() if sell_it else ""
 
-            match = (not buy_q  or buy_q  in buy_txt) and \
-                    (not sell_q or sell_q in sell_txt)
+            match = self._matches_terms(buy_txt, buy_terms) and \
+                    self._matches_terms(sell_txt, sell_terms)
             self.table.setRowHidden(r, not match)
 
     def _clear_filters(self):
@@ -826,9 +840,15 @@ class SpreadPanel(QWidget):
 
     def update_pairs(self, pairs: List[SpreadEntry]):
         table = self.table
+        allowed_keys = {entry.pair_key for entry in pairs}
+        for row in range(table.rowCount() - 1, -1, -1):
+            item = table.item(row, C_BUY)
+            key = item.data(Qt.UserRole) if item else None
+            if key not in allowed_keys:
+                table.removeRow(row)
+
+        self._sync_index()
         for entry in pairs:
-            if not entry.should_show():
-                continue
             key = entry.pair_key
 
             if key not in self._row_index:
@@ -861,7 +881,7 @@ class SpreadPanel(QWidget):
             self._set_spread(row, entry)
 
         self._sync_index()
-        # Переприменяем фильтр к новым строкам (только скрываем/показываем)
+        self._apply_filter()
         # Сортировку НЕ переприменяем — она статична после клика на заголовок
 
     def _find_row(self, key: str) -> int:
@@ -1291,7 +1311,7 @@ class DetailMonitorWidget(QWidget):
         self._stop()
         self._symbol = base
         self._update_count = 0
-        self._history = SpreadHistoryManager()
+        self._history = SpreadHistoryManager(base, persist=True)
         # Закрываем все открытые окна истории
         for win in list(self._spread_wins.values()):
             win.close()
@@ -1394,13 +1414,21 @@ class DetailMonitorWidget(QWidget):
         parts = source.split('_')
         return '_'.join(parts[:-1]), parts[-1]
 
+    @staticmethod
+    def _activate_cached_window(wins: Dict[str, QWidget], key: str) -> bool:
+        win = wins.get(key)
+        if win is None:
+            return False
+        if not win.isVisible():
+            win.show()
+        win.raise_()
+        win.activateWindow()
+        return True
+
     def _open_spread_history(self, pair_key: str):
         if not self._symbol:
             return
-        if pair_key in self._spread_wins:
-            win = self._spread_wins[pair_key]
-            win.raise_()
-            win.activateWindow()
+        if self._activate_cached_window(self._spread_wins, pair_key):
             return
         buy_src, sell_src = pair_key.split('>>')
         buy_exc_id,  buy_mkt  = self._parse_source(buy_src)
@@ -1414,6 +1442,7 @@ class DetailMonitorWidget(QWidget):
             symbol=self._symbol,
             history=self._history,
         )
+        win.setAttribute(Qt.WA_DeleteOnClose, True)
         win.destroyed.connect(lambda: self._spread_wins.pop(pair_key, None))
         self._spread_wins[pair_key] = win
         win.show()
@@ -1421,10 +1450,7 @@ class DetailMonitorWidget(QWidget):
     def _open_funding_history(self, pair_key: str):
         if not self._symbol:
             return
-        if pair_key in self._fund_wins:
-            win = self._fund_wins[pair_key]
-            win.raise_()
-            win.activateWindow()
+        if self._activate_cached_window(self._fund_wins, pair_key):
             return
         buy_src, sell_src = pair_key.split('>>')
         buy_exc_id,  buy_mkt  = self._parse_source(buy_src)
@@ -1436,6 +1462,7 @@ class DetailMonitorWidget(QWidget):
             sell_exc_id=sell_exc_id, sell_mkt=sell_mkt,
             symbol=self._symbol,
         )
+        win.setAttribute(Qt.WA_DeleteOnClose, True)
         win.destroyed.connect(lambda: self._fund_wins.pop(pair_key, None))
         self._fund_wins[pair_key] = win
         win.show()

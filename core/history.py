@@ -1,25 +1,17 @@
 """
 Хранение истории спреда в памяти + загрузка исторических данных с бирж.
-Данные не сохраняются на диск — сбрасываются при закрытии программы.
+При включённом persist закрытые live-бары и загруженная история сохраняются в SQLite.
 """
 from __future__ import annotations
 import asyncio
 import time
-from dataclasses import dataclass
 from typing import Any
 
 from core.config import async_retry, ccxt_config, format_network_error
+from core.history_types import OHLCVBar
+from core.spread_storage import SpreadHistoryStorage
 
 # ── Структуры данных ──────────────────────────────────────────────────────────
-
-@dataclass
-class OHLCVBar:
-    ts: int        # unix ms, время открытия бара
-    open: float
-    high: float
-    low: float
-    close: float
-    interval_ms: int = 60_000
 
 BASE_LIVE_TF_MS = 10_000
 TF_SECONDS = {'1s': 1, '10s': 10, '1m': 60, '5m': 300, '15m': 900, '1h': 3600}
@@ -115,10 +107,36 @@ def _compute_spread_bars(
 class SpreadHistoryManager:
     """Хранит историю спредов в памяти в виде OHLCV-баров."""
 
-    def __init__(self):
+    def __init__(self, symbol: str = "", persist: bool = False, storage: SpreadHistoryStorage | None = None):
+        self._symbol = symbol.upper()
+        self._storage = storage if persist else None
+        if persist and self._storage is None:
+            self._storage = SpreadHistoryStorage()
+        self._loaded_pairs: set[str] = set()
         self._hist: dict[str, dict] = {}  # pair_key → historical {'in': [], 'out': []}
         self._live: dict[str, dict] = {}  # pair_key → closed live {'in': [], 'out': []}
         self._cur:  dict[str, dict] = {}  # pair_key → текущий незакрытый бар
+
+    def _load_persisted(self, pair_key: str) -> None:
+        if not self._storage or not self._symbol or pair_key in self._loaded_pairs:
+            return
+        self._loaded_pairs.add(pair_key)
+        in_bars = self._storage.load_bars(self._symbol, pair_key, 'in')
+        out_bars = self._storage.load_bars(self._symbol, pair_key, 'out')
+        if in_bars or out_bars:
+            self._hist[pair_key] = {
+                'in': self._merge_bars(self._hist.get(pair_key, {'in': [], 'out': []})['in'], in_bars),
+                'out': self._merge_bars(self._hist.get(pair_key, {'in': [], 'out': []})['out'], out_bars),
+            }
+
+    @staticmethod
+    def _merge_bars(old: list[OHLCVBar], new: list[OHLCVBar]) -> list[OHLCVBar]:
+        if not new:
+            return list(old)
+        by_key = {(bar.ts, bar.interval_ms): bar for bar in old}
+        for bar in new:
+            by_key[(bar.ts, bar.interval_ms)] = bar
+        return sorted(by_key.values(), key=lambda b: (b.ts, b.interval_ms))
 
     def add_live_spread(self, pair_key: str, ts_ms: int,
                         in_spread: float, out_spread: float) -> None:
@@ -130,8 +148,13 @@ class SpreadHistoryManager:
             # Закрываем предыдущий бар
             if cur and 'io' in cur:
                 d = self._live.setdefault(pair_key, {'in': [], 'out': []})
-                d['in'].append( OHLCVBar(cur['ts'], cur['io'], cur['ih'], cur['il'], cur['ic'], BASE_LIVE_TF_MS))
-                d['out'].append(OHLCVBar(cur['ts'], cur['oo'], cur['oh'], cur['ol'], cur['oc'], BASE_LIVE_TF_MS))
+                in_bar = OHLCVBar(cur['ts'], cur['io'], cur['ih'], cur['il'], cur['ic'], BASE_LIVE_TF_MS)
+                out_bar = OHLCVBar(cur['ts'], cur['oo'], cur['oh'], cur['ol'], cur['oc'], BASE_LIVE_TF_MS)
+                d['in'].append(in_bar)
+                d['out'].append(out_bar)
+                if self._storage and self._symbol:
+                    self._storage.save_bars(self._symbol, pair_key, 'in', [in_bar])
+                    self._storage.save_bars(self._symbol, pair_key, 'out', [out_bar])
                 if len(d['in']) > MAX_LIVE_BARS_PER_PAIR:
                     del d['in'][:-MAX_LIVE_BARS_PER_PAIR]
                     del d['out'][:-MAX_LIVE_BARS_PER_PAIR]
@@ -149,6 +172,7 @@ class SpreadHistoryManager:
     def set_historical(self, pair_key: str,
                        in_bars: list[OHLCVBar], out_bars: list[OHLCVBar]) -> None:
         """Сохраняет исторические данные, смерживая с накопленными live-барами."""
+        self._load_persisted(pair_key)
         existing = self._hist.get(pair_key, {'in': [], 'out': []})
 
         def merge(old: list[OHLCVBar], new: list[OHLCVBar]) -> list[OHLCVBar]:
@@ -167,10 +191,14 @@ class SpreadHistoryManager:
             'in': merge(existing['in'], in_bars),
             'out': merge(existing['out'], out_bars),
         }
+        if self._storage and self._symbol:
+            self._storage.save_bars(self._symbol, pair_key, 'in', in_bars)
+            self._storage.save_bars(self._symbol, pair_key, 'out', out_bars)
 
     def get_bars(self, pair_key: str,
                  tf: str = '1m') -> tuple[list[OHLCVBar], list[OHLCVBar]]:
         """Возвращает (in_bars, out_bars) для заданного таймфрейма."""
+        self._load_persisted(pair_key)
         hist = self._hist.get(pair_key, {'in': [], 'out': []})
         live = self._live.get(pair_key, {'in': [], 'out': []})
         in_bars  = list(hist['in']) + list(live['in'])

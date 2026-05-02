@@ -20,6 +20,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "websocket_proxy": "auto",
     "request_retries": 3,
     "retry_delay_sec": 1.0,
+    "history_db_path": "spread_history.sqlite3",
 }
 
 
@@ -81,6 +82,17 @@ def get_float_config(key: str, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def project_path(path: str) -> str:
+    if os.path.isabs(path):
+        return path
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), path)
+
+
+def get_history_db_path() -> str:
+    value = str(load_config().get("history_db_path", DEFAULT_CONFIG["history_db_path"])).strip()
+    return project_path(value or DEFAULT_CONFIG["history_db_path"])
 
 
 def get_proxy_url(kind: str = "rest") -> str:
