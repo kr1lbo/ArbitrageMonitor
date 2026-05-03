@@ -25,7 +25,6 @@ CONFIG_PATH = default_config_path()
 _LAST_CONFIG_ERROR: str = ""
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "alert_spread": 1.0,
     "sound_path": "",
     "main_top_n": 100,
     "detail_top_n": 50,
@@ -42,6 +41,7 @@ def _merged_config(data: dict[str, Any]) -> dict[str, Any]:
     values = dict(data)
     if "top_n" in values and "detail_top_n" not in values:
         values["detail_top_n"] = values["top_n"]
+    values.pop("alert_spread", None)
     merged.update(values)
     return merged
 

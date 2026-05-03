@@ -123,10 +123,11 @@ bybit | aster | bingx
   "request_retries": 3,
   "retry_delay_sec": 1.0,
   "history_db_path": "spread_history.sqlite3",
-  "alert_spread": 1.0,
   "sound_path": ""
 }
 ```
+
+Порог сигнального спреда не хранится в `config.json`: он задаётся отдельно в каждой детальной вкладке в поле `Сигнал`.
 
 ### Лимиты
 

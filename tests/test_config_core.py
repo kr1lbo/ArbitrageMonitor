@@ -60,7 +60,7 @@ class ConfigCoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             config_mod.CONFIG_PATH = os.path.join(tmp, "config.json")
             with open(config_mod.CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump({"main_top_n": 12, "detail_top_n": 34}, f)
+                json.dump({"main_top_n": 12, "detail_top_n": 34, "alert_spread": 9.99}, f)
 
             cfg = config_mod.ensure_config()
             with open(config_mod.CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -71,6 +71,7 @@ class ConfigCoreTests(unittest.TestCase):
         self.assertEqual(saved["main_top_n"], 12)
         self.assertEqual(saved["detail_top_n"], 34)
         self.assertIn("history_db_path", saved)
+        self.assertNotIn("alert_spread", saved)
 
     def test_invalid_config_is_not_overwritten_by_ensure_config(self):
         with tempfile.TemporaryDirectory() as tmp:

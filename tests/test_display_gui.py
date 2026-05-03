@@ -74,7 +74,6 @@ class SpreadPanelGuiTests(unittest.TestCase):
         widget = DetailMonitorWidget(
             get_enabled=lambda: [],
             get_top_n=lambda: 50,
-            get_alert_spread=lambda: 0.0,
             get_sound_path=lambda: "",
             audio=object(),
             before_start=lambda: calls.append("reload"),
@@ -91,7 +90,6 @@ class SpreadPanelGuiTests(unittest.TestCase):
             enabled=[],
             main_top_n=100,
             detail_top_n=50,
-            alert_spread=0.0,
             sound_path="",
             proxy="",
             websocket_proxy="direct",
@@ -107,7 +105,6 @@ class SpreadPanelGuiTests(unittest.TestCase):
         cfg = {
             "main_top_n": 100,
             "detail_top_n": 50,
-            "alert_spread": 0.0,
             "sound_path": "",
             "proxy": "",
             "websocket_proxy": "direct",
@@ -176,6 +173,30 @@ class SpreadPanelGuiTests(unittest.TestCase):
 
         self.assertEqual(win._tabs.tabText(win._tabs.indexOf(tab)), "ETH")
         self.assertIs(win._token_tabs["ETH"], tab)
+
+    def test_detail_tab_has_own_alert_threshold_field(self):
+        win = self._make_main_window()
+        tab = win._tabs.widget(1)
+
+        self.assertEqual(tab._alert_spread.value(), 0.0)
+        self.assertEqual(tab._alert_spread.specialValueText(), "Выкл")
+        self.assertEqual(tab._alert_spread.width(), 92)
+        tab._alert_spread.setValue(1.25)
+        self.assertEqual(tab._alert_spread.value(), 1.25)
+
+    def test_alerting_detail_tab_is_highlighted(self):
+        win = self._make_main_window()
+        tab = win._tabs.widget(1)
+        win._on_detail_started(tab, "BTC")
+
+        win._set_detail_alert(tab, True)
+
+        index = win._tabs.indexOf(tab)
+        self.assertEqual(win._tabs.tabText(index), "!! BTC")
+        self.assertEqual(win._tabs.tabBar().tabTextColor(index), display_mod.QColor(display_mod.C["red"]))
+
+        win._set_detail_alert(tab, False)
+        self.assertEqual(win._tabs.tabText(index), "BTC")
 
     def test_detail_tabs_are_closable_but_scanner_is_fixed(self):
         win = self._make_main_window()

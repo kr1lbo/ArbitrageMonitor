@@ -1132,7 +1132,7 @@ class TickerPanel(QWidget):
 class SettingsDialog(QDialog):
     def __init__(
         self, exchanges, enabled, main_top_n, detail_top_n,
-        alert_spread, sound_path, proxy, websocket_proxy,
+        sound_path, proxy, websocket_proxy,
         config_path: str = "", config_error: str = "", parent=None,
     ):
         super().__init__(parent)
@@ -1203,19 +1203,8 @@ class SettingsDialog(QDialog):
 
         sep2 = QFrame(); sep2.setObjectName("sep"); lay.addWidget(sep2)
 
-        alert_lbl = QLabel("Звуковой сигнал"); alert_lbl.setObjectName("sub")
+        alert_lbl = QLabel("Звуковое уведомление"); alert_lbl.setObjectName("sub")
         lay.addWidget(alert_lbl)
-
-        spread_row = QHBoxLayout()
-        spread_row.addWidget(QLabel("Сигнальный спред:"))
-        self._alert_spread = QDoubleSpinBox()
-        self._alert_spread.setRange(0.0, 100.0)
-        self._alert_spread.setDecimals(2)
-        self._alert_spread.setSingleStep(0.1)
-        self._alert_spread.setSuffix(" %")
-        self._alert_spread.setValue(alert_spread)
-        spread_row.addWidget(self._alert_spread); spread_row.addStretch()
-        lay.addLayout(spread_row)
 
         file_row = QHBoxLayout()
         file_row.addWidget(QLabel("Звуковой файл:"))
@@ -1262,7 +1251,6 @@ class SettingsDialog(QDialog):
     def get_enabled(self):      return [k for k, v in self._checks.items() if v.isChecked()]
     def get_main_top_n(self):   return self._main_top_n.value()
     def get_detail_top_n(self): return self._detail_top_n.value()
-    def get_alert_spread(self): return self._alert_spread.value()
     def get_sound_path(self):   return self._sound_edit.text().strip()
     def get_proxy(self):        return self._proxy_edit.text().strip()
     def get_websocket_proxy(self): return self._websocket_proxy_edit.text().strip()
@@ -1274,12 +1262,12 @@ class SettingsDialog(QDialog):
 
 class DetailMonitorWidget(QWidget):
     token_started = pyqtSignal(str)
+    alert_changed = pyqtSignal(bool)
 
     def __init__(
         self,
         get_enabled: Callable[[], List[str]],
         get_top_n: Callable[[], int],
-        get_alert_spread: Callable[[], float],
         get_sound_path: Callable[[], str],
         audio: AudioAlert,
         settings_callback: Optional[Callable[[], None]] = None,
@@ -1290,7 +1278,6 @@ class DetailMonitorWidget(QWidget):
         super().__init__()
         self._get_enabled = get_enabled
         self._get_top_n = get_top_n
-        self._get_alert_spread = get_alert_spread
         self._get_sound_path = get_sound_path
         self._audio = audio
         self._settings_callback = settings_callback
@@ -1329,6 +1316,18 @@ class DetailMonitorWidget(QWidget):
         self._token.setText(initial_token)
         self._token.returnPressed.connect(self.start_current)
         ir.addWidget(self._token, 1)
+
+        ir.addWidget(QLabel("Сигнал:"))
+        self._alert_spread = QDoubleSpinBox()
+        self._alert_spread.setRange(0.0, 100.0)
+        self._alert_spread.setDecimals(2)
+        self._alert_spread.setSingleStep(0.1)
+        self._alert_spread.setSuffix(" %")
+        self._alert_spread.setSpecialValueText("Выкл")
+        self._alert_spread.setFixedWidth(92)
+        self._alert_spread.setToolTip("Порог спреда для звукового сигнала в этой вкладке")
+        self._alert_spread.valueChanged.connect(lambda _value: self._set_alerted(False))
+        ir.addWidget(self._alert_spread)
 
         self._btn_start = QPushButton("▶  СТАРТ")
         self._btn_start.setObjectName("accent")
@@ -1404,6 +1403,12 @@ class DetailMonitorWidget(QWidget):
         self._token.setText(token)
         self.start_current()
 
+    def _set_alerted(self, active: bool):
+        if self._alerted == active:
+            return
+        self._alerted = active
+        self.alert_changed.emit(active)
+
     def start_current(self):
         if self._before_start:
             self._before_start()
@@ -1412,6 +1417,7 @@ class DetailMonitorWidget(QWidget):
             self._status.setText("⚠ Введите токен")
             return
         self.token_started.emit(base)
+        self._set_alerted(False)
         self._stop()
         self._symbol = base
         self._update_count = 0
@@ -1436,6 +1442,7 @@ class DetailMonitorWidget(QWidget):
 
     def _stop(self):
         self._render_timer.stop()
+        self._set_alerted(False)
         if self._worker:
             self._worker.stop()
             self._worker = None
@@ -1483,19 +1490,22 @@ class DetailMonitorWidget(QWidget):
             f"▶ {self._symbol}  •  {online}/{total} онлайн  •  {visible} пар"
         )
 
-        alert_spread = self._get_alert_spread()
+        alert_spread = self._alert_spread.value()
         sound_path = self._get_sound_path()
-        if alert_spread > 0 and sound_path:
+        if alert_spread > 0:
             visible_keys = self._spread_panel.visible_pair_keys()
             best = max(
                 (p.spread_pct for p in pairs if p.pair_key in visible_keys),
                 default=0.0,
             )
             if best >= alert_spread and not self._alerted:
-                self._alerted = True
-                self._audio.play()
+                self._set_alerted(True)
+                if sound_path:
+                    self._audio.play()
             elif best < alert_spread:
-                self._alerted = False
+                self._set_alerted(False)
+        else:
+            self._set_alerted(False)
 
     def _on_row_moved(self, new_order: List[str]):
         if self._worker and self._worker.monitor:
@@ -1592,7 +1602,6 @@ class MainWindow(QMainWindow):
 
         self._main_top_n: int = 100
         self._detail_top_n: int = 50
-        self._alert_spread: float = 1.0
         self._sound_path: str = ""
         self._proxy: str = ""
         self._websocket_proxy: str = "auto"
@@ -1611,6 +1620,8 @@ class MainWindow(QMainWindow):
 
         self._token_tabs: Dict[str, DetailMonitorWidget] = {}
         self._detail_tabs: List[DetailMonitorWidget] = []
+        self._tab_labels: Dict[DetailMonitorWidget, str] = {}
+        self._alert_tabs: Dict[DetailMonitorWidget, bool] = {}
 
         self._btn_add_detail = QPushButton("+ Новая вкладка")
         self._btn_add_detail.setObjectName("new_tab_btn")
@@ -1636,7 +1647,6 @@ class MainWindow(QMainWindow):
         tab = DetailMonitorWidget(
             get_enabled=lambda: list(self._enabled),
             get_top_n=lambda: self._detail_top_n,
-            get_alert_spread=lambda: self._alert_spread,
             get_sound_path=lambda: self._sound_path,
             audio=self._audio,
             settings_callback=self._settings,
@@ -1645,6 +1655,7 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         tab.token_started.connect(lambda started_token, detail=tab: self._on_detail_started(detail, started_token))
+        tab.alert_changed.connect(lambda active, detail=tab: self._set_detail_alert(detail, active))
         return tab
 
     def _add_detail_tab(
@@ -1656,6 +1667,8 @@ class MainWindow(QMainWindow):
         token = self._normalize_token(token)
         tab = self._make_detail_tab(token)
         self._detail_tabs.append(tab)
+        self._tab_labels[tab] = token or "ДЕТАЛЬНО"
+        self._alert_tabs[tab] = False
         index = self._tabs.addTab(tab, token or "ДЕТАЛЬНО")
         self._install_detail_close_button(tab)
         if token:
@@ -1698,17 +1711,9 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             return default
 
-    @staticmethod
-    def _cfg_float(cfg: dict[str, Any], key: str, default: float) -> float:
-        try:
-            return float(cfg.get(key, default))
-        except (TypeError, ValueError):
-            return default
-
     def _apply_config(self, cfg: dict[str, Any]):
         self._main_top_n = self._cfg_int(cfg, "main_top_n", 100)
         self._detail_top_n = self._cfg_int(cfg, "detail_top_n", 50)
-        self._alert_spread = self._cfg_float(cfg, "alert_spread", 1.0)
         self._sound_path = str(cfg.get("sound_path", "") or "")
         self._proxy = str(cfg.get("proxy", "") or "")
         self._websocket_proxy = str(cfg.get("websocket_proxy", "auto") or "auto")
@@ -1732,7 +1737,24 @@ class MainWindow(QMainWindow):
         self._token_tabs[token] = tab
         index = self._tabs.indexOf(tab)
         if index >= 0:
-            self._tabs.setTabText(index, token)
+            self._set_detail_tab_label(tab, token)
+
+    def _set_detail_tab_label(self, tab: DetailMonitorWidget, label: str):
+        self._tab_labels[tab] = label
+        self._refresh_detail_tab_label(tab)
+
+    def _set_detail_alert(self, tab: DetailMonitorWidget, active: bool):
+        self._alert_tabs[tab] = active
+        self._refresh_detail_tab_label(tab)
+
+    def _refresh_detail_tab_label(self, tab: DetailMonitorWidget):
+        index = self._tabs.indexOf(tab)
+        if index < 0:
+            return
+        label = self._tab_labels.get(tab, "ДЕТАЛЬНО")
+        active = self._alert_tabs.get(tab, False)
+        self._tabs.setTabText(index, f"!! {label}" if active else label)
+        self._tabs.tabBar().setTabTextColor(index, QColor(C["red"]) if active else QColor())
 
     def _open_token_from_scanner(self, token: str):
         token = self._normalize_token(token)
@@ -1752,6 +1774,8 @@ class MainWindow(QMainWindow):
             widget.close_monitor()
             if widget in self._detail_tabs:
                 self._detail_tabs.remove(widget)
+            self._tab_labels.pop(widget, None)
+            self._alert_tabs.pop(widget, None)
             for token, tab in list(self._token_tabs.items()):
                 if tab is widget:
                     self._token_tabs.pop(token, None)
@@ -1765,7 +1789,7 @@ class MainWindow(QMainWindow):
         self._reload_config()
         dlg = SettingsDialog(
             self._exchanges, self._enabled, self._main_top_n, self._detail_top_n,
-            self._alert_spread, self._sound_path, self._proxy, self._websocket_proxy,
+            self._sound_path, self._proxy, self._websocket_proxy,
             get_config_path(), get_config_error(), self
         )
         dlg.setStyleSheet(SS)
@@ -1773,7 +1797,6 @@ class MainWindow(QMainWindow):
             self._enabled      = dlg.get_enabled()
             self._main_top_n   = dlg.get_main_top_n()
             self._detail_top_n = dlg.get_detail_top_n()
-            self._alert_spread = dlg.get_alert_spread()
             self._sound_path   = dlg.get_sound_path()
             self._proxy        = dlg.get_proxy()
             self._websocket_proxy = dlg.get_websocket_proxy()
@@ -1781,7 +1804,6 @@ class MainWindow(QMainWindow):
             save_config({
                 "main_top_n": self._main_top_n,
                 "detail_top_n": self._detail_top_n,
-                "alert_spread": self._alert_spread,
                 "sound_path":   self._sound_path,
                 "proxy":        self._proxy,
                 "websocket_proxy": self._websocket_proxy,
@@ -1793,6 +1815,8 @@ class MainWindow(QMainWindow):
             tab.close_monitor()
         self._detail_tabs.clear()
         self._token_tabs.clear()
+        self._tab_labels.clear()
+        self._alert_tabs.clear()
         super().closeEvent(e)
 
 
