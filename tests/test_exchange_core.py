@@ -85,6 +85,25 @@ class ExchangeCoreTests(unittest.TestCase):
         self.assertEqual(pairs[0].pair_key, "funding_edge>>perp")
         self.assertEqual(pairs[1].pair_key, "high_spread>>perp")
 
+    def test_spread_entry_detects_low_liquidity_by_quote_volume(self):
+        liquid = SpreadEntry(
+            pair_key="a>>b",
+            buy_source="A",
+            sell_source="B",
+            buy_volume_24h=60_000,
+            sell_volume_24h=70_000,
+        )
+        low = SpreadEntry(
+            pair_key="a>>b",
+            buy_source="A",
+            sell_source="B",
+            buy_volume_24h=49_000,
+            sell_volume_24h=70_000,
+        )
+
+        self.assertFalse(liquid.is_low_liquidity())
+        self.assertTrue(low.is_low_liquidity())
+
 
 if __name__ == "__main__":
     unittest.main()

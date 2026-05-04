@@ -39,6 +39,7 @@ _C = {
 pg.setConfigOptions(antialias=False)
 
 MAX_SPREAD_RENDER_POINTS = 4_000
+SPREAD_FETCH_TIMEOUT_SEC = 120
 
 _SS = f"""
 QMainWindow, QWidget {{
@@ -210,8 +211,13 @@ class SpreadFetchWorker(QThread):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            in_b, out_b = loop.run_until_complete(fetch_historical_spread(*self._args))
+            in_b, out_b = loop.run_until_complete(asyncio.wait_for(
+                fetch_historical_spread(*self._args),
+                timeout=SPREAD_FETCH_TIMEOUT_SEC,
+            ))
             self.done.emit(in_b, out_b)
+        except asyncio.TimeoutError:
+            self.error.emit(f'Таймаут загрузки истории ({SPREAD_FETCH_TIMEOUT_SEC} сек)')
         except Exception as exc:
             self.error.emit(str(exc))
         finally:
@@ -280,6 +286,7 @@ class SpreadHistoryWindow(QMainWindow):
         self._worker:   SpreadFetchWorker | None = None
         self._loaded_fetch_tfs: set[str] = set()
         self._pending_fetch_tf = ''
+        self._fetch_completed = False
 
         self.setWindowTitle(f'История спреда — {symbol}  {buy_label} → {sell_label}')
         self.setStyleSheet(_SS)
@@ -380,27 +387,54 @@ class SpreadHistoryWindow(QMainWindow):
             return
         fetch_tf = self._fetch_tf_for_current_view()
         self._pending_fetch_tf = fetch_tf
+        self._fetch_completed = False
         self._status_lbl.setText('Загрузка исторических данных…')
+        self._status_lbl.setToolTip('')
         self._refresh_btn.setEnabled(False)
-        self._worker = SpreadFetchWorker(*self._buy_exc, *self._sell_exc, self._symbol, fetch_tf)
-        self._worker.done.connect(self._on_fetch_done)
-        self._worker.error.connect(self._on_fetch_error)
-        self._worker.start()
+        self._refresh_btn.setText('Загрузка…')
+        worker = SpreadFetchWorker(*self._buy_exc, *self._sell_exc, self._symbol, fetch_tf)
+        self._worker = worker
+        worker.done.connect(lambda in_b, out_b, w=worker: self._on_fetch_done(in_b, out_b, w))
+        worker.error.connect(lambda msg, w=worker: self._on_fetch_error(msg, w))
+        worker.finished.connect(lambda w=worker: self._on_fetch_finished(w))
+        worker.start()
 
-    def _on_fetch_done(self, in_bars: list, out_bars: list):
+    def _on_fetch_done(self, in_bars: list, out_bars: list, worker=None):
+        if worker is not None and worker is not self._worker:
+            return
+        self._fetch_completed = True
         self._loaded_fetch_tfs.add(self._pending_fetch_tf or self._fetch_tf_for_current_view())
         self._history.set_historical(self._pair_key, in_bars, out_bars)
         loaded_tf = f'{int(in_bars[0].interval_ms / 1000)}s' if in_bars else self._fetch_tf_for_current_view()
         if in_bars and in_bars[0].interval_ms >= 60_000:
             loaded_tf = f'{int(in_bars[0].interval_ms / 60_000)}m'
         self._status_lbl.setText(f'Загружено {len(in_bars)} свечей ({loaded_tf})  •  live ↻')
+        self._status_lbl.setToolTip('')
         self._refresh_btn.setEnabled(True)
+        self._refresh_btn.setText('↺ Обновить')
         self._render(auto_range=True)
 
-    def _on_fetch_error(self, msg: str):
-        self._status_lbl.setText(f'Ошибка загрузки: {msg[:70]}  (показаны live-данные)')
-        self._refresh_btn.setEnabled(True)
+    def _on_fetch_error(self, msg: str, worker=None):
+        if worker is not None and worker is not self._worker:
+            return
+        self._fetch_completed = True
         self._render(auto_range=True)
+        self._status_lbl.setText(f'Ошибка загрузки: {msg[:140]}  (показаны live-данные)')
+        self._status_lbl.setToolTip(msg)
+        self._refresh_btn.setEnabled(True)
+        self._refresh_btn.setText('↺ Обновить')
+
+    def _on_fetch_finished(self, worker=None):
+        if worker is not None and worker is not self._worker:
+            return
+        if not self._fetch_completed:
+            self._render(auto_range=True)
+            self._status_lbl.setText('Ошибка загрузки: поток завершился без результата  (показаны live-данные)')
+            self._status_lbl.setToolTip('Поток загрузки исторических данных завершился без сигналов done/error.')
+        self._refresh_btn.setEnabled(True)
+        self._refresh_btn.setText('↺ Обновить')
+        self._fetch_completed = False
+        self._worker = None
 
     # ── Отрисовка графиков ────────────────────────────────────────────────────
 

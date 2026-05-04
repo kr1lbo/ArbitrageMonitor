@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from statistics import median
 from typing import Any
 
-from core.exchange import EXCHANGE_CONFIGS, source_label
+from core.exchange import EXCHANGE_CONFIGS, LOW_LIQUIDITY_VOLUME_24H, source_label
 from core.config import async_retry, ccxt_config, format_network_error
 from core.history import exchange_history_options
 
@@ -15,7 +15,11 @@ QUOTE_CODES = {"USDT", "USDC"}
 MAX_EXCHANGE_CONCURRENCY = 4
 PRICE_OUTLIER_FACTOR = 1.25
 MAX_TICKER_SPREAD_PCT = 2.0
-MIN_VOLUME_24H = 5_000.0
+MIN_VOLUME_24H = LOW_LIQUIDITY_VOLUME_24H
+ORDER_BOOK_NOTIONAL_USD = 1_000.0
+ORDER_BOOK_MAX_SLIPPAGE_PCT = 1.0
+ORDER_BOOK_DEPTH_LIMIT = 50
+ORDER_BOOK_CHECK_MAX_ENTRIES = 200
 
 
 @dataclass
@@ -30,6 +34,7 @@ class ScannerQuote:
     volume_24h: float | None = None
     funding_rate: float | None = None
     timestamp_ms: int = 0
+    ticker_spread_pct: float = 0.0
 
 
 @dataclass
@@ -47,6 +52,18 @@ class ScannerEntry:
     sources_count: int = 0
     volume_24h: float = 0.0
     updated_ms: int = 0
+    pos_buy_exchange_id: str = ""
+    pos_buy_market_type: str = ""
+    pos_buy_symbol: str = ""
+    pos_sell_exchange_id: str = ""
+    pos_sell_market_type: str = ""
+    pos_sell_symbol: str = ""
+    neg_buy_exchange_id: str = ""
+    neg_buy_market_type: str = ""
+    neg_buy_symbol: str = ""
+    neg_sell_exchange_id: str = ""
+    neg_sell_market_type: str = ""
+    neg_sell_symbol: str = ""
 
 
 def _safe_float(value: Any) -> float | None:
@@ -95,7 +112,11 @@ def _quote_from_ticker(
 
     buy_price = ask
     sell_price = bid
-    volume = _safe_float(ticker.get("quoteVolume") or ticker.get("baseVolume"))
+    volume = _safe_float(ticker.get("quoteVolume"))
+    if volume is None:
+        base_volume = _safe_float(ticker.get("baseVolume"))
+        if base_volume is not None:
+            volume = base_volume * ((bid + ask) / 2)
     if volume is not None and volume < MIN_VOLUME_24H:
         return None
     return ScannerQuote(
@@ -109,6 +130,7 @@ def _quote_from_ticker(
         volume_24h=volume,
         funding_rate=_funding_from_ticker(ticker) if market_type == "perp" else None,
         timestamp_ms=int(ticker.get("timestamp") or now_ms),
+        ticker_spread_pct=ticker_spread,
     )
 
 
@@ -152,12 +174,24 @@ def compute_scanner_entries(quotes: list[ScannerQuote], top_n: int = 100) -> lis
             entry.pos_buy_source = source_label(buy.exchange_id, buy.market_type)
             entry.pos_sell_source = source_label(sell.exchange_id, sell.market_type)
             entry.pos_fund_result = _fund_result(buy, sell)
+            entry.pos_buy_exchange_id = buy.exchange_id
+            entry.pos_buy_market_type = buy.market_type
+            entry.pos_buy_symbol = buy.symbol
+            entry.pos_sell_exchange_id = sell.exchange_id
+            entry.pos_sell_market_type = sell.market_type
+            entry.pos_sell_symbol = sell.symbol
         if best_neg is not None:
             spread, buy, sell = best_neg
             entry.neg_spread = spread
             entry.neg_buy_source = source_label(buy.exchange_id, buy.market_type)
             entry.neg_sell_source = source_label(sell.exchange_id, sell.market_type)
             entry.neg_fund_result = _fund_result(buy, sell)
+            entry.neg_buy_exchange_id = buy.exchange_id
+            entry.neg_buy_market_type = buy.market_type
+            entry.neg_buy_symbol = buy.symbol
+            entry.neg_sell_exchange_id = sell.exchange_id
+            entry.neg_sell_market_type = sell.market_type
+            entry.neg_sell_symbol = sell.symbol
 
         entry.max_abs_spread = max(
             abs(entry.pos_spread or 0.0),
@@ -261,4 +295,168 @@ def _market_matches(market: dict, market_type: str) -> bool:
 
 async def scan_market(exchanges: list[str], top_n: int = 100) -> tuple[list[ScannerEntry], list[str]]:
     quotes, errors = await fetch_scanner_quotes(exchanges)
-    return compute_scanner_entries(quotes, top_n=top_n), errors
+    candidate_limit = _candidate_limit_for_liquidity(top_n)
+    candidates = compute_scanner_entries(quotes, top_n=candidate_limit)
+    filtered, liquidity_errors = await filter_entries_by_order_book_liquidity(candidates, top_n=top_n)
+    return filtered, errors + liquidity_errors
+
+
+def _candidate_limit_for_liquidity(top_n: int) -> int:
+    if top_n <= 0:
+        return ORDER_BOOK_CHECK_MAX_ENTRIES
+    return min(max(top_n * 3, top_n), ORDER_BOOK_CHECK_MAX_ENTRIES)
+
+
+@dataclass
+class OrderBookLiquidity:
+    ask_slippage_pct: float | None
+    bid_slippage_pct: float | None
+
+    @property
+    def ask_ok(self) -> bool:
+        return self.ask_slippage_pct is not None and self.ask_slippage_pct <= ORDER_BOOK_MAX_SLIPPAGE_PCT
+
+    @property
+    def bid_ok(self) -> bool:
+        return self.bid_slippage_pct is not None and self.bid_slippage_pct <= ORDER_BOOK_MAX_SLIPPAGE_PCT
+
+
+def order_book_slippage_pct(levels: list, notional_usd: float, side: str) -> float | None:
+    if not levels or notional_usd <= 0:
+        return None
+    best_price = _safe_float(levels[0][0])
+    if best_price is None or best_price <= 0:
+        return None
+
+    remaining = notional_usd
+    qty_total = 0.0
+    quote_total = 0.0
+    for level in levels:
+        if len(level) < 2:
+            continue
+        price = _safe_float(level[0])
+        amount = _safe_float(level[1])
+        if price is None or amount is None or price <= 0 or amount <= 0:
+            continue
+        level_quote = price * amount
+        take_quote = min(remaining, level_quote)
+        take_qty = take_quote / price
+        qty_total += take_qty
+        quote_total += take_quote
+        remaining -= take_quote
+        if remaining <= 1e-9:
+            break
+
+    if remaining > 1e-6 or qty_total <= 0:
+        return None
+    avg_price = quote_total / qty_total
+    if side == "ask":
+        return max(0.0, (avg_price - best_price) / best_price * 100)
+    return max(0.0, (best_price - avg_price) / best_price * 100)
+
+
+def order_book_liquidity(order_book: dict) -> OrderBookLiquidity:
+    return OrderBookLiquidity(
+        ask_slippage_pct=order_book_slippage_pct(order_book.get("asks") or [], ORDER_BOOK_NOTIONAL_USD, "ask"),
+        bid_slippage_pct=order_book_slippage_pct(order_book.get("bids") or [], ORDER_BOOK_NOTIONAL_USD, "bid"),
+    )
+
+
+async def filter_entries_by_order_book_liquidity(
+    entries: list[ScannerEntry],
+    top_n: int = 100,
+) -> tuple[list[ScannerEntry], list[str]]:
+    if not entries:
+        return [], []
+    checks, errors = await _fetch_order_book_liquidity_for_entries(entries)
+    filtered: list[ScannerEntry] = []
+    for entry in entries:
+        pos_ok = _entry_route_liquid(entry, "pos", checks)
+        neg_ok = _entry_route_liquid(entry, "neg", checks)
+        if not pos_ok:
+            entry.pos_spread = None
+            entry.pos_buy_source = entry.pos_sell_source = ""
+            entry.pos_fund_result = None
+        if not neg_ok:
+            entry.neg_spread = None
+            entry.neg_buy_source = entry.neg_sell_source = ""
+            entry.neg_fund_result = None
+        entry.max_abs_spread = max(abs(entry.pos_spread or 0.0), abs(entry.neg_spread or 0.0))
+        if entry.pos_spread is not None or entry.neg_spread is not None:
+            filtered.append(entry)
+
+    filtered.sort(key=lambda e: e.max_abs_spread, reverse=True)
+    if top_n > 0:
+        filtered = filtered[:top_n]
+    return filtered, errors[:20]
+
+
+def _entry_route_liquid(
+    entry: ScannerEntry,
+    prefix: str,
+    checks: dict[tuple[str, str, str], OrderBookLiquidity],
+) -> bool:
+    spread = getattr(entry, f"{prefix}_spread")
+    if spread is None:
+        return False
+    buy_key = (
+        getattr(entry, f"{prefix}_buy_exchange_id"),
+        getattr(entry, f"{prefix}_buy_market_type"),
+        getattr(entry, f"{prefix}_buy_symbol"),
+    )
+    sell_key = (
+        getattr(entry, f"{prefix}_sell_exchange_id"),
+        getattr(entry, f"{prefix}_sell_market_type"),
+        getattr(entry, f"{prefix}_sell_symbol"),
+    )
+    buy_liq = checks.get(buy_key)
+    sell_liq = checks.get(sell_key)
+    return bool(buy_liq and sell_liq and buy_liq.ask_ok and sell_liq.bid_ok)
+
+
+async def _fetch_order_book_liquidity_for_entries(
+    entries: list[ScannerEntry],
+) -> tuple[dict[tuple[str, str, str], OrderBookLiquidity], list[str]]:
+    import ccxt.async_support as ccxt_a
+
+    needed: dict[tuple[str, str], set[str]] = {}
+    for entry in entries:
+        for prefix in ("pos", "neg"):
+            for side in ("buy", "sell"):
+                exchange_id = getattr(entry, f"{prefix}_{side}_exchange_id")
+                market_type = getattr(entry, f"{prefix}_{side}_market_type")
+                symbol = getattr(entry, f"{prefix}_{side}_symbol")
+                if exchange_id and market_type and symbol:
+                    needed.setdefault((exchange_id, market_type), set()).add(symbol)
+
+    checks: dict[tuple[str, str, str], OrderBookLiquidity] = {}
+    errors: list[str] = []
+
+    async def fetch_group(exchange_id: str, market_type: str, symbols: set[str]):
+        exc = getattr(ccxt_a, exchange_id)(
+            ccxt_config(exchange_history_options(exchange_id, market_type), timeout=15_000)
+        )
+        try:
+            await async_retry(lambda: exc.load_markets(), f"{exchange_id}_{market_type} load_markets")
+            for symbol in sorted(symbols):
+                try:
+                    if symbol not in exc.markets:
+                        continue
+                    order_book = await async_retry(
+                        lambda symbol=symbol: exc.fetch_order_book(symbol, limit=ORDER_BOOK_DEPTH_LIMIT),
+                        f"{exchange_id}_{market_type} {symbol} fetch_order_book",
+                    )
+                    checks[(exchange_id, market_type, symbol)] = order_book_liquidity(order_book or {})
+                except Exception as exc_err:
+                    errors.append(format_network_error(
+                        f"{exchange_id}_{market_type}",
+                        f"fetch_order_book {symbol}",
+                        exc_err,
+                    )[:240])
+        except Exception as exc_err:
+            errors.append(format_network_error(f"{exchange_id}_{market_type}", "load_markets", exc_err)[:240])
+        finally:
+            await exc.close()
+
+    await asyncio.gather(*(fetch_group(ex, mkt, symbols) for (ex, mkt), symbols in needed.items()))
+    return checks, errors

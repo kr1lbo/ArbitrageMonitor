@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 FUND_SHOW_THRESHOLD = 0.20   # показывать пару если fund_result >= этого значения
 MIN_SPREAD_PCT      = 0.0    # минимальный спред для показа
 MAX_UPDATE_HZ       = 30     # максимальное количество UI-обновлений в секунду
+LOW_LIQUIDITY_VOLUME_24H = 50_000.0
 
 EXCHANGE_CONFIGS: Dict[str, dict] = {
     "binance":        {"spot": True,  "perp": True,  "funding": True},
@@ -98,6 +99,8 @@ class SpreadEntry:
     spread_pct: float = 0.0
     buy_funding: Optional[float] = None
     sell_funding: Optional[float] = None
+    buy_volume_24h: Optional[float] = None
+    sell_volume_24h: Optional[float] = None
 
     @property
     def fund_result(self) -> Optional[float]:
@@ -118,6 +121,10 @@ class SpreadEntry:
             return True
         fr = self.fund_result
         return fr is not None and fr >= FUND_SHOW_THRESHOLD
+
+    def is_low_liquidity(self, min_volume_24h: float = LOW_LIQUIDITY_VOLUME_24H) -> bool:
+        volumes = [v for v in (self.buy_volume_24h, self.sell_volume_24h) if v is not None]
+        return bool(volumes) and any(v < min_volume_24h for v in volumes)
 
 
 class ExchangeMonitor:
@@ -212,10 +219,13 @@ class ExchangeMonitor:
                     ticker = await exchange.watch_ticker(symbol)
                     price = ticker.get("last") or ticker.get("close")
                     if price:
+                        quote_volume = ticker.get("quoteVolume")
+                        if quote_volume is None and ticker.get("baseVolume") is not None:
+                            quote_volume = ticker.get("baseVolume") * price
                         async with self._lock:
                             td = self.tickers[source]
                             td.price = price
-                            td.volume_24h = ticker.get("baseVolume")
+                            td.volume_24h = quote_volume
                             td.timestamp = datetime.now()
                             td.status = "Онлайн"
                             td.error = None
@@ -312,6 +322,8 @@ class ExchangeMonitor:
                 spread_pct=spread,
                 buy_funding=buy_td.funding_rate,
                 sell_funding=sell_td.funding_rate,
+                buy_volume_24h=buy_td.volume_24h,
+                sell_volume_24h=sell_td.volume_24h,
             )
             self.pair_map[key] = entry
             self.pair_order.append(key)
@@ -322,6 +334,8 @@ class ExchangeMonitor:
             e.spread_pct = spread
             e.buy_funding = buy_td.funding_rate
             e.sell_funding = sell_td.funding_rate
+            e.buy_volume_24h = buy_td.volume_24h
+            e.sell_volume_24h = sell_td.volume_24h
 
     def _recalc_for(self, updated_source: str):
         td_u = self.tickers.get(updated_source)

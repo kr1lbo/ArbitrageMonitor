@@ -23,7 +23,7 @@ from PyQt5.QtWidgets import (
 from core.exchange import (
     ExchangeMonitor, SpreadEntry, TickerData,
     EXCHANGE_CONFIGS, EXCHANGE_LABELS,
-    source_label, FUND_SHOW_THRESHOLD,
+    source_label, FUND_SHOW_THRESHOLD, LOW_LIQUIDITY_VOLUME_24H,
 )
 from core.config import (
     ensure_config, get_config_error, get_config_path, load_config, save_config,
@@ -219,6 +219,16 @@ QScrollBar::handle:vertical {{
     background: {C['border']};
     border-radius: 3px;
     min-height: 20px;
+}}
+QScrollBar:horizontal {{
+    background: {C['bg']};
+    height: 8px;
+    border: none;
+}}
+QScrollBar::handle:horizontal {{
+    background: {C['border']};
+    border-radius: 4px;
+    min-width: 24px;
 }}
 QLabel#title {{
     font-size: 17px;
@@ -451,17 +461,23 @@ class ScannerPanel(QWidget):
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setAlternatingRowColors(True)
         self.table.setSortingEnabled(False)
+        self.table.setWordWrap(False)
+        self.table.setTextElideMode(Qt.ElideNone)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.table.cellDoubleClicked.connect(self._open_row)
 
         hdr = self.table.horizontalHeader()
         hdr.setSectionResizeMode(self.C_TOKEN, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(self.C_POS, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(self.C_POS_ROUTE, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(self.C_POS_ROUTE, QHeaderView.Interactive)
         hdr.setSectionResizeMode(self.C_NEG, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(self.C_NEG_ROUTE, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(self.C_NEG_ROUTE, QHeaderView.Interactive)
         hdr.setSectionResizeMode(self.C_FUND, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(self.C_SOURCES, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(self.C_UPDATED, QHeaderView.ResizeToContents)
+        self.table.setColumnWidth(self.C_POS_ROUTE, 260)
+        self.table.setColumnWidth(self.C_NEG_ROUTE, 260)
         hdr.setSectionsClickable(True)
         hdr.setSortIndicatorShown(True)
         hdr.sectionClicked.connect(self._on_header_click)
@@ -564,13 +580,17 @@ class ScannerPanel(QWidget):
             if entry.pos_spread is not None:
                 _clr(pos, C["green"] if entry.pos_spread > 0 else C["muted"], C["green_bg"] if entry.pos_spread >= 1 else None)
             self.table.setItem(row, self.C_POS, pos)
-            self.table.setItem(row, self.C_POS_ROUTE, _mk(_route(entry.pos_buy_source, entry.pos_sell_source), Qt.AlignLeft))
+            pos_route = _mk(_route(entry.pos_buy_source, entry.pos_sell_source), Qt.AlignLeft)
+            pos_route.setToolTip(pos_route.text())
+            self.table.setItem(row, self.C_POS_ROUTE, pos_route)
 
             neg = _mk(_fmt_pct(entry.neg_spread))
             if entry.neg_spread is not None:
                 _clr(neg, C["red"] if entry.neg_spread < 0 else C["muted"], C["red_bg"] if entry.neg_spread <= -1 else None)
             self.table.setItem(row, self.C_NEG, neg)
-            self.table.setItem(row, self.C_NEG_ROUTE, _mk(_route(entry.neg_buy_source, entry.neg_sell_source), Qt.AlignLeft))
+            neg_route = _mk(_route(entry.neg_buy_source, entry.neg_sell_source), Qt.AlignLeft)
+            neg_route.setToolTip(neg_route.text())
+            self.table.setItem(row, self.C_NEG_ROUTE, neg_route)
 
             best_funding = _best_funding(entry)
             fund = _mk(_fmt_pct(best_funding))
@@ -623,6 +643,10 @@ class SpreadTableWidget(QTableWidget):
         self.setSelectionBehavior(QTableWidget.SelectRows)
         self.setShowGrid(True)
         self.setSortingEnabled(False)
+        self.setWordWrap(False)
+        self.setTextElideMode(Qt.ElideNone)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
 
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
@@ -638,6 +662,8 @@ class SpreadTableWidget(QTableWidget):
         hdr.setSectionResizeMode(C_FUND_R, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(C_HS,     QHeaderView.Fixed)
         hdr.setSectionResizeMode(C_HF,     QHeaderView.Fixed)
+        self.setColumnWidth(C_BUY, 240)
+        self.setColumnWidth(C_SELL, 240)
         self.setColumnWidth(C_HS, 38)
         self.setColumnWidth(C_HF, 38)
         self.verticalHeader().setDefaultSectionSize(26)
@@ -839,6 +865,7 @@ class SpreadPanel(QWidget):
         self._filter_buy.setToolTip("Можно указать несколько вариантов через |, например: bybit | aster | bingx")
         self._filter_buy.setClearButtonEnabled(True)
         self._filter_buy.textChanged.connect(self._apply_filter)
+        self._filter_buy.setMaximumWidth(660)
         filter_row.addWidget(self._filter_buy, 1)
 
         filter_row.addSpacing(12)
@@ -850,6 +877,7 @@ class SpreadPanel(QWidget):
         self._filter_sell.setToolTip("Можно указать несколько вариантов через |, например: bybit | aster | bingx")
         self._filter_sell.setClearButtonEnabled(True)
         self._filter_sell.textChanged.connect(self._apply_filter)
+        self._filter_sell.setMaximumWidth(660)
         filter_row.addWidget(self._filter_sell, 1)
 
         self._clear_btn = QPushButton("✕")
@@ -858,6 +886,13 @@ class SpreadPanel(QWidget):
         self._clear_btn.clicked.connect(self._clear_filters)
         filter_row.addWidget(self._clear_btn)
 
+        self._hide_low_liq = QCheckBox("Скрыть низколиквидные")
+        self._hide_low_liq.setToolTip(
+            f"Скрывать пары, где объём 24ч одной из сторон ниже ${LOW_LIQUIDITY_VOLUME_24H:,.0f}"
+        )
+        self._hide_low_liq.toggled.connect(self._apply_filter)
+        filter_row.addWidget(self._hide_low_liq)
+
         lay.addLayout(filter_row)
 
         # ── Таблица ───────────────────────────────────────────────────────────
@@ -865,6 +900,7 @@ class SpreadPanel(QWidget):
         lay.addWidget(self.table)
 
         self._row_index: Dict[str, int] = {}
+        self._low_liq_keys: set[str] = set()
 
     @staticmethod
     def _filter_lbl(text: str) -> QLabel:
@@ -898,17 +934,22 @@ class SpreadPanel(QWidget):
 
             match = self._matches_terms(buy_txt, buy_terms) and \
                     self._matches_terms(sell_txt, sell_terms)
+            key = buy_it.data(Qt.UserRole) if buy_it else ""
+            if self._hide_low_liq.isChecked() and key in self._low_liq_keys:
+                match = False
             self.table.setRowHidden(r, not match)
 
     def _clear_filters(self):
         self._filter_buy.clear()
         self._filter_sell.clear()
+        self._hide_low_liq.setChecked(False)
 
     # ── Обновление данных ─────────────────────────────────────────────────────
 
     def update_pairs(self, pairs: List[SpreadEntry]):
         table = self.table
         allowed_keys = {entry.pair_key for entry in pairs}
+        self._low_liq_keys.intersection_update(allowed_keys)
         for row in range(table.rowCount() - 1, -1, -1):
             item = table.item(row, C_BUY)
             key = item.data(Qt.UserRole) if item else None
@@ -918,6 +959,10 @@ class SpreadPanel(QWidget):
         self._sync_index()
         for entry in pairs:
             key = entry.pair_key
+            if entry.is_low_liquidity():
+                self._low_liq_keys.add(key)
+            else:
+                self._low_liq_keys.discard(key)
 
             if key not in self._row_index:
                 row = table.rowCount()
@@ -981,6 +1026,8 @@ class SpreadPanel(QWidget):
         # СПРЕД
         sp_it = cell(C_SPREAD)
         sp_it.setText(f"{e.spread_pct:+.4f}%")
+        liq_tip = self._liquidity_tooltip(e)
+        sp_it.setToolTip(liq_tip)
         if e.spread_pct >= 1.0:
             _clr(sp_it, "#ffffff", C["green_bg"])
         elif e.spread_pct >= 0.3:
@@ -989,6 +1036,9 @@ class SpreadPanel(QWidget):
             _clr(sp_it, C["text"], None)
         else:
             _clr(sp_it, C["muted"], None)
+
+        for col in (C_BUY, C_SELL):
+            cell(col).setToolTip(liq_tip)
 
         # FUND LONG
         fb = e.buy_funding
@@ -1047,9 +1097,22 @@ class SpreadPanel(QWidget):
                     keys.add(key)
         return keys
 
+    @staticmethod
+    def _liquidity_tooltip(e: SpreadEntry) -> str:
+        def fmt(value: Optional[float]) -> str:
+            return "нет данных" if value is None else f"${value:,.0f}"
+
+        if e.is_low_liquidity():
+            return (
+                "Низкая ликвидность: "
+                f"buy 24ч {fmt(e.buy_volume_24h)}, sell 24ч {fmt(e.sell_volume_24h)}"
+            )
+        return f"Объём 24ч: buy {fmt(e.buy_volume_24h)}, sell {fmt(e.sell_volume_24h)}"
+
     def clear_all(self):
         self.table.setRowCount(0)
         self._row_index.clear()
+        self._low_liq_keys.clear()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1073,11 +1136,16 @@ class TickerPanel(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(False)
+        self.table.setTextElideMode(Qt.ElideNone)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
 
         hdr = self.table.horizontalHeader()
-        hdr.setSectionResizeMode(0, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(0, QHeaderView.Interactive)
         for c in (1, 2, 3):
             hdr.setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        self.table.setColumnWidth(0, 140)
         self.table.verticalHeader().setDefaultSectionSize(24)
         lay.addWidget(self.table)
 
@@ -1089,7 +1157,9 @@ class TickerPanel(QWidget):
                 row = self.table.rowCount()
                 self.table.insertRow(row)
                 self._rows[source] = row
-                self.table.setItem(row, 0, _mk(source_label(td.exchange_id, td.market_type), Qt.AlignLeft))
+                source_item = _mk(source_label(td.exchange_id, td.market_type), Qt.AlignLeft)
+                source_item.setToolTip(source_item.text())
+                self.table.setItem(row, 0, source_item)
 
             row = self._rows[source]
 
@@ -1353,8 +1423,10 @@ class DetailMonitorWidget(QWidget):
 
         # Сплиттер
         splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
 
         left = QWidget()
+        left.setMinimumWidth(720)
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 4, 0)
         ll.setSpacing(3)
@@ -1371,14 +1443,16 @@ class DetailMonitorWidget(QWidget):
         splitter.addWidget(left)
 
         right = QWidget()
+        right.setMinimumWidth(360)
         rl = QVBoxLayout(right)
         rl.setContentsMargins(4, 0, 0, 0)
         self._ticker_panel = TickerPanel()
         rl.addWidget(self._ticker_panel)
         splitter.addWidget(right)
 
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
+        splitter.setSizes([1260, 360])
         root.addWidget(splitter, 1)
 
         hint = QLabel(

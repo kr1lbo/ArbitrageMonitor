@@ -1,16 +1,18 @@
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QApplication, QTabBar, QWidget
+from PyQt5.QtWidgets import QApplication, QLabel, QPushButton, QHeaderView, QTabBar, QWidget
 
 from core.exchange import SpreadEntry
 from gui import display as display_mod
-from gui.display import DetailMonitorWidget, SS, ScannerPanel, SettingsDialog, SpreadPanel
+from gui.display import DetailMonitorWidget, SS, ScannerPanel, SettingsDialog, SpreadPanel, TickerPanel
+from gui.history_window import SpreadHistoryWindow
 
 
 class SpreadPanelGuiTests(unittest.TestCase):
@@ -42,6 +44,37 @@ class SpreadPanelGuiTests(unittest.TestCase):
             {"binance_spot>>bybit_perp", "aster_perp>>bybit_perp"},
         )
 
+    def test_spread_panel_can_hide_low_liquidity_pairs(self):
+        panel = SpreadPanel()
+        panel.update_pairs([
+            SpreadEntry(
+                "liquid_spot>>liquid_perp",
+                "Liquid SPOT",
+                "Liquid PERP",
+                spread_pct=1.0,
+                buy_volume_24h=100_000,
+                sell_volume_24h=120_000,
+            ),
+            SpreadEntry(
+                "thin_spot>>thin_perp",
+                "Thin SPOT",
+                "Thin PERP",
+                spread_pct=2.0,
+                buy_volume_24h=10_000,
+                sell_volume_24h=120_000,
+            ),
+        ])
+
+        panel._hide_low_liq.setChecked(True)
+
+        hidden_by_key = {}
+        for row in range(panel.table.rowCount()):
+            item = panel.table.item(row, 0)
+            hidden_by_key[item.data(Qt.UserRole)] = panel.table.isRowHidden(row)
+
+        self.assertFalse(hidden_by_key["liquid_spot>>liquid_perp"])
+        self.assertTrue(hidden_by_key["thin_spot>>thin_perp"])
+
     def test_cached_history_window_is_shown_again_after_close(self):
         win = QWidget()
         wins = {"pair": win}
@@ -56,6 +89,63 @@ class SpreadPanelGuiTests(unittest.TestCase):
         self.assertTrue(win.isVisible())
         win.close()
 
+    def test_spread_history_fetch_error_reenables_refresh(self):
+        dummy = SimpleNamespace(
+            _fetch_completed=False,
+            _status_lbl=QLabel(),
+            _refresh_btn=QPushButton(),
+            _render=lambda auto_range=False: dummy._status_lbl.setText("live status"),
+            _worker=object(),
+        )
+        dummy._refresh_btn.setEnabled(False)
+
+        SpreadHistoryWindow._on_fetch_error(dummy, "gate/bitget failed")
+
+        self.assertTrue(dummy._refresh_btn.isEnabled())
+        self.assertEqual(dummy._refresh_btn.text(), "↺ Обновить")
+        self.assertTrue(dummy._fetch_completed)
+        self.assertIn("Ошибка загрузки", dummy._status_lbl.text())
+        self.assertIn("gate/bitget failed", dummy._status_lbl.toolTip())
+
+    def test_spread_history_fetch_finished_reenables_refresh_without_signals(self):
+        rendered = []
+        dummy = SimpleNamespace(
+            _fetch_completed=False,
+            _status_lbl=QLabel(),
+            _refresh_btn=QPushButton(),
+            _render=lambda auto_range=False: rendered.append(auto_range),
+            _worker=object(),
+        )
+        dummy._refresh_btn.setEnabled(False)
+
+        SpreadHistoryWindow._on_fetch_finished(dummy)
+
+        self.assertTrue(dummy._refresh_btn.isEnabled())
+        self.assertEqual(dummy._refresh_btn.text(), "↺ Обновить")
+        self.assertIsNone(dummy._worker)
+        self.assertEqual(rendered, [True])
+        self.assertIn("без результата", dummy._status_lbl.text())
+
+    def test_spread_history_ignores_stale_worker_signals(self):
+        current_worker = object()
+        stale_worker = object()
+        rendered = []
+        dummy = SimpleNamespace(
+            _fetch_completed=False,
+            _status_lbl=QLabel(),
+            _refresh_btn=QPushButton(),
+            _render=lambda auto_range=False: rendered.append(auto_range),
+            _worker=current_worker,
+        )
+        dummy._refresh_btn.setEnabled(False)
+
+        SpreadHistoryWindow._on_fetch_error(dummy, "old error", stale_worker)
+        SpreadHistoryWindow._on_fetch_finished(dummy, stale_worker)
+
+        self.assertFalse(dummy._refresh_btn.isEnabled())
+        self.assertIs(dummy._worker, current_worker)
+        self.assertEqual(rendered, [])
+
     def test_scanner_reloads_config_before_scan(self):
         calls = []
         panel = ScannerPanel(
@@ -68,6 +158,40 @@ class SpreadPanelGuiTests(unittest.TestCase):
 
         self.assertEqual(calls, ["reload"])
         self.assertEqual(panel._status.text(), "Нет включённых бирж")
+
+    def test_scanner_table_supports_horizontal_scrolling_without_elision(self):
+        panel = ScannerPanel(get_exchanges=lambda: [], get_top_n=lambda: 100)
+
+        self.assertEqual(panel.table.textElideMode(), Qt.ElideNone)
+        self.assertEqual(panel.table.horizontalScrollBarPolicy(), Qt.ScrollBarAsNeeded)
+        self.assertEqual(
+            panel.table.horizontalHeader().sectionResizeMode(panel.C_POS_ROUTE),
+            QHeaderView.Interactive,
+        )
+
+    def test_ticker_panel_source_column_keeps_full_names_scrollable(self):
+        panel = TickerPanel()
+
+        self.assertEqual(panel.table.textElideMode(), Qt.ElideNone)
+        self.assertEqual(panel.table.horizontalScrollBarPolicy(), Qt.ScrollBarAsNeeded)
+        self.assertEqual(panel.table.horizontalHeader().sectionResizeMode(0), QHeaderView.Interactive)
+        self.assertGreaterEqual(panel.table.columnWidth(0), 140)
+
+    def test_spread_table_supports_horizontal_scrolling_without_elision(self):
+        panel = SpreadPanel()
+
+        self.assertEqual(panel.table.textElideMode(), Qt.ElideNone)
+        self.assertEqual(panel.table.horizontalScrollBarPolicy(), Qt.ScrollBarAsNeeded)
+        self.assertEqual(panel.table.horizontalHeader().sectionResizeMode(0), QHeaderView.Stretch)
+        self.assertEqual(panel.table.horizontalHeader().sectionResizeMode(1), QHeaderView.Stretch)
+        self.assertLessEqual(panel.table.columnWidth(6), 40)
+        self.assertLessEqual(panel.table.columnWidth(7), 40)
+
+    def test_exchange_filter_inputs_are_capped_to_leave_room_for_sources(self):
+        panel = SpreadPanel()
+
+        self.assertEqual(panel._filter_buy.maximumWidth(), 660)
+        self.assertEqual(panel._filter_sell.maximumWidth(), 660)
 
     def test_detail_reloads_config_before_start(self):
         calls = []
@@ -197,6 +321,19 @@ class SpreadPanelGuiTests(unittest.TestCase):
 
         win._set_detail_alert(tab, False)
         self.assertEqual(win._tabs.tabText(index), "BTC")
+
+    def test_detail_splitter_reserves_room_for_sources_panel(self):
+        win = self._make_main_window()
+        detail = win._tabs.widget(1)
+        splitter = detail._spread_panel.parentWidget().parentWidget()
+        left = splitter.widget(0)
+        right = splitter.widget(1)
+
+        self.assertGreaterEqual(left.minimumWidth(), 720)
+        self.assertGreaterEqual(right.minimumWidth(), 360)
+        self.assertEqual(left.sizePolicy().horizontalStretch(), 1)
+        self.assertEqual(right.sizePolicy().horizontalStretch(), 0)
+        self.assertFalse(splitter.childrenCollapsible())
 
     def test_detail_tabs_are_closable_but_scanner_is_fixed(self):
         win = self._make_main_window()
