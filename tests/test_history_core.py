@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 from core.history import (
     OHLCVBar, SpreadHistoryManager,
     _candidate_timeframes, _compute_spread_bars, _fetch_limit_for_timeframe,
-    _fetch_ohlcv_paged, _resample,
+    _fetch_ohlcv_paged, _resample, _resolve_symbol,
     funding_bucket_ts_ms, funding_interval_label, infer_funding_interval_ms,
     normalize_funding_history_rows,
 )
@@ -113,6 +113,16 @@ class HistoryCoreTests(unittest.TestCase):
         self.assertEqual(len(rows), 1440)
         self.assertEqual(rows[0][0], start + 60_000)
         self.assertEqual(rows[-1][0], start + 1440 * 60_000)
+
+    def test_resolve_symbol_uses_exchange_specific_fallback_candidates(self):
+        class FakeExchange:
+            id = "aster"
+            markets = {"RAVE/USD1": object()}
+
+        self.assertEqual(
+            _resolve_symbol(FakeExchange(), "RAVE/USDT", ["RAVE/USDT", "RAVE/USD1"]),
+            "RAVE/USD1",
+        )
 
     def test_normalize_funding_rows_sorts_dedupes_and_converts_to_percent(self):
         rows = normalize_funding_history_rows([

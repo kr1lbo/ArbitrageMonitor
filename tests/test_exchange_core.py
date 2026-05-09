@@ -1,6 +1,6 @@
 import unittest
 
-from core.exchange import ExchangeMonitor, SpreadEntry
+from core.exchange import ExchangeMonitor, SpreadEntry, make_market_symbol_candidates, make_spot_symbol
 
 
 class ExchangeCoreTests(unittest.TestCase):
@@ -103,6 +103,13 @@ class ExchangeCoreTests(unittest.TestCase):
 
         self.assertFalse(liquid.is_low_liquidity())
         self.assertTrue(low.is_low_liquidity())
+
+    def test_aster_spot_symbol_candidates_include_usd1_fallback(self):
+        self.assertEqual(make_spot_symbol("aster", "RAVE"), "RAVE/USDT")
+        self.assertEqual(
+            make_market_symbol_candidates("aster", "spot", "RAVE"),
+            ["RAVE/USDT", "RAVE/USD1"],
+        )
 
 
 if __name__ == "__main__":

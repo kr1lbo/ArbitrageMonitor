@@ -62,17 +62,55 @@ def source_label(exchange_id: str, market_type: str) -> str:
 
 
 def make_spot_symbol(exchange_id: str, base: str) -> str:
-    if exchange_id in ["lighter", "hyperliquid"]:
-        return f"{base}/USDC"
-    return f"{base}/USDT"
+    return make_market_symbol_candidates(exchange_id, "spot", base)[0]
 
 
 def make_perp_symbol(exchange_id: str, base: str) -> str:
+    return make_market_symbol_candidates(exchange_id, "perp", base)[0]
+
+
+def make_market_symbol_candidates(exchange_id: str, market_type: str, base: str) -> list[str]:
+    base = base.upper()
+    if market_type == "spot":
+        return _unique_symbols(_spot_symbol_candidates(exchange_id, base))
+    return _unique_symbols(_perp_symbol_candidates(exchange_id, base))
+
+
+def _spot_symbol_candidates(exchange_id: str, base: str) -> list[str]:
+    if exchange_id in ["lighter", "hyperliquid"]:
+        return [f"{base}/USDC"]
+    if exchange_id == "aster":
+        return [f"{base}/USDT", f"{base}/USD1"]
+    return [f"{base}/USDT"]
+
+
+def _perp_symbol_candidates(exchange_id: str, base: str) -> list[str]:
     if exchange_id in ["hyperliquid", "lighter"]:
-        return f"{base}/USDC:USDC"
+        return [f"{base}/USDC:USDC"]
     # kucoinfutures использует unified ccxt формат RAVE/USDT:USDT
     # (внутренний id биржи RAVEUSDTM — ccxt конвертирует сам)
-    return f"{base}/USDT:USDT"
+    return [f"{base}/USDT:USDT"]
+
+
+def _unique_symbols(symbols: list[str]) -> list[str]:
+    result: list[str] = []
+    for symbol in symbols:
+        if symbol not in result:
+            result.append(symbol)
+    return result
+
+
+def find_market_symbol(exchange, exchange_id: str, market_type: str, base: str) -> Optional[str]:
+    markets = getattr(exchange, "markets", {}) or {}
+    for symbol in make_market_symbol_candidates(exchange_id, market_type, base):
+        if symbol in markets:
+            return symbol
+    return None
+
+
+def similar_market_symbols(markets: dict, base: str, limit: int = 20) -> str:
+    prefix = base.upper().split('/')[0] + '/'
+    return ', '.join([s for s in markets if s.startswith(prefix)][:limit])
 
 
 @dataclass
@@ -201,13 +239,21 @@ class ExchangeMonitor:
                 stage = "load_markets"
                 await async_retry(lambda: exchange.load_markets(), f"{source} load_markets")
 
-                if symbol not in exchange.markets:
+                resolved_symbol = find_market_symbol(exchange, exchange_id, market_type, base)
+                if not resolved_symbol:
+                    tried = ', '.join(make_market_symbol_candidates(exchange_id, market_type, base))
+                    similar = similar_market_symbols(exchange.markets, base)
+                    suffix = f". Похожие: {similar}" if similar else ""
                     async with self._lock:
                         self.tickers[source].status = "Нет пары"
-                        self.tickers[source].error = f"{symbol} не найден"
+                        self.tickers[source].error = f"{tried} не найден{suffix}"
                     self._emit()
                     await exchange.close()
                     return
+                symbol = resolved_symbol
+                async with self._lock:
+                    if source in self.tickers:
+                        self.tickers[source].symbol = symbol
 
                 async with self._lock:
                     self.tickers[source].status = "Онлайн"

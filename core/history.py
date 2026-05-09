@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 import asyncio
+import logging
 import time
 from typing import Any
 
@@ -21,6 +22,7 @@ FETCH_RETRIES = 3
 FETCH_TIMEOUT_MS = 30_000
 MAX_OHLCV_BATCH = 1000
 MAX_LIVE_BARS_PER_PAIR = 12_000
+logger = logging.getLogger(__name__)
 
 
 # ── Ресемплинг ────────────────────────────────────────────────────────────────
@@ -222,24 +224,25 @@ async def fetch_historical_spread(
 ) -> tuple[list[OHLCVBar], list[OHLCVBar]]:
     """Загружает OHLCV с двух бирж и возвращает (in_bars, out_bars)."""
     import ccxt.async_support as ccxt_a
-    from core.exchange import make_spot_symbol, make_perp_symbol
+    from core.exchange import make_market_symbol_candidates
 
     def make(exc_id: str, mkt: str):
-        sym  = make_spot_symbol(exc_id, symbol) if mkt == 'spot' else make_perp_symbol(exc_id, symbol)
+        candidates = make_market_symbol_candidates(exc_id, mkt, symbol)
+        sym = candidates[0]
         exc  = getattr(ccxt_a, exc_id)(
             ccxt_config(exchange_history_options(exc_id, mkt), timeout=FETCH_TIMEOUT_MS)
         )
-        return exc, sym
+        return exc, sym, candidates
 
-    buy_exc,  buy_sym  = make(buy_exc_id,  buy_mkt)
-    sell_exc, sell_sym = make(sell_exc_id, sell_mkt)
+    buy_exc,  buy_sym,  buy_candidates  = make(buy_exc_id,  buy_mkt)
+    sell_exc, sell_sym, sell_candidates = make(sell_exc_id, sell_mkt)
     try:
         await asyncio.gather(
             _load_markets_for_history(buy_exc, buy_exc.id, buy_exc.options.get('defaultType', 'spot')),
             _load_markets_for_history(sell_exc, sell_exc.id, sell_exc.options.get('defaultType', 'spot')),
         )
-        _ensure_symbol(buy_exc, buy_sym)
-        _ensure_symbol(sell_exc, sell_sym)
+        buy_sym = _resolve_symbol(buy_exc, buy_sym, buy_candidates)
+        sell_sym = _resolve_symbol(sell_exc, sell_sym, sell_candidates)
 
         errors: list[str] = []
         for fetch_tf in _candidate_timeframes(buy_exc, sell_exc, tf):
@@ -326,13 +329,23 @@ async def _async_fetch_ohlcv(exchange, symbol: str, preferred_tf: str, limit: in
     raise RuntimeError(f'{exchange.id}: не удалось загрузить OHLCV для {symbol}. ' + ' | '.join(errors))
 
 
-def _ensure_symbol(exchange, symbol: str) -> None:
-    if symbol in exchange.markets:
-        return
+def _resolve_symbol(exchange, symbol: str, candidates: list[str] | None = None) -> str:
+    symbols = []
+    for candidate in candidates or [symbol]:
+        if candidate not in symbols:
+            symbols.append(candidate)
+    for candidate in symbols:
+        if candidate in exchange.markets:
+            return candidate
     base_prefix = symbol.split('/')[0] + '/'
     similar = ', '.join([s for s in exchange.markets if s.startswith(base_prefix)][:20])
     suffix = f' Доступные похожие: {similar}' if similar else ''
-    raise ValueError(f'{exchange.id}: {symbol} не найден в markets.{suffix}')
+    tried = ', '.join(symbols)
+    raise ValueError(f'{exchange.id}: {tried} не найден в markets.{suffix}')
+
+
+def _ensure_symbol(exchange, symbol: str) -> None:
+    _resolve_symbol(exchange, symbol)
 
 
 def _supports_timeframe(exchange, tf: str) -> bool:
@@ -467,27 +480,31 @@ def normalize_funding_history_rows(rows: list[dict]) -> list[dict]:
 
 
 async def fetch_funding_history(
-    exc_id: str, mkt: str, symbol: str, limit: int = 200
+    exc_id: str, mkt: str, symbol: str, limit: int = 200, strict: bool = False
 ) -> list[dict]:
     """Возвращает [{ts, rate}]. Для spot — пустой список."""
     if mkt == 'spot':
         return []
     import ccxt.async_support as ccxt_a
-    from core.exchange import make_perp_symbol
+    from core.exchange import make_market_symbol_candidates
     exc  = getattr(ccxt_a, exc_id)(
         ccxt_config(exchange_history_options(exc_id, mkt), timeout=FETCH_TIMEOUT_MS)
     )
     try:
-        sym = make_perp_symbol(exc_id, symbol)
+        candidates = make_market_symbol_candidates(exc_id, 'perp', symbol)
+        sym = candidates[0]
         await _load_markets_for_history(exc, exc_id, _history_market_type(exc_id, mkt))
-        if sym not in exc.markets:
-            return []
+        sym = _resolve_symbol(exc, sym, candidates)
         rows = await _retry(
             lambda: exc.fetch_funding_rate_history(sym, limit=limit),
             f'{exc_id} {sym} fetch_funding_rate_history',
         )
         return normalize_funding_history_rows(rows or [])
-    except Exception:
+    except Exception as exc_info:
+        msg = format_network_error(exc_id, f'{symbol} fetch_funding_rate_history', exc_info)
+        if strict:
+            raise RuntimeError(msg) from exc_info
+        logger.warning(msg)
         return []
     finally:
         await exc.close()

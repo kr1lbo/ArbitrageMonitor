@@ -229,7 +229,7 @@ class SpreadFetchWorker(QThread):
 
 
 class FundingFetchWorker(QThread):
-    done  = pyqtSignal(list, list)
+    done  = pyqtSignal(list, list, str)
     error = pyqtSignal(str)
 
     def __init__(self, buy_exc_id, buy_mkt, sell_exc_id, sell_mkt, symbol):
@@ -241,14 +241,21 @@ class FundingFetchWorker(QThread):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
+            async def load_one(label: str, args: tuple):
+                try:
+                    return await fetch_funding_history(*args, strict=True), ""
+                except Exception as exc:
+                    return [], f"{label}: {exc}"
+
             async def load_both():
                 return await asyncio.gather(
-                    fetch_funding_history(*self._buy),
-                    fetch_funding_history(*self._sell),
+                    load_one("buy", self._buy),
+                    load_one("sell", self._sell),
                 )
 
-            b_h, s_h = loop.run_until_complete(load_both())
-            self.done.emit(b_h, s_h)
+            (b_h, b_err), (s_h, s_err) = loop.run_until_complete(load_both())
+            warnings = " | ".join(err for err in (b_err, s_err) if err)
+            self.done.emit(b_h, s_h, warnings)
         except Exception as exc:
             self.error.emit(str(exc))
         finally:
@@ -624,14 +631,18 @@ class FundingHistoryWindow(QMainWindow):
         self._worker.error.connect(self._on_error)
         self._worker.start()
 
-    def _on_done(self, buy_hist: list, sell_hist: list):
+    def _on_done(self, buy_hist: list, sell_hist: list, warnings: str = ""):
         b_cnt = len(buy_hist)
         s_cnt = len(sell_hist)
         b_int = funding_interval_label(buy_hist) if self._buy_mkt == 'perp' else 'spot'
         s_int = funding_interval_label(sell_hist) if self._sell_mkt == 'perp' else 'spot'
-        self._status_lbl.setText(
-            f'Загружено: buy={b_cnt} ({b_int})  /  sell={s_cnt} ({s_int})'
-        )
+        text = f'Загружено: buy={b_cnt} ({b_int})  /  sell={s_cnt} ({s_int})'
+        if warnings:
+            text += f'  |  Ошибки: {warnings[:90]}'
+            self._status_lbl.setToolTip(warnings)
+        else:
+            self._status_lbl.setToolTip('')
+        self._status_lbl.setText(text)
         self._draw(buy_hist, sell_hist)
 
     def _on_error(self, msg: str):
